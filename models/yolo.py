@@ -117,11 +117,10 @@ class Model(nn.Module):
         self.info()  # 打印网络参数相关信息
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
             return self.forward_augment(x)  # augmented inference, None
-        else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+        return self.forward_once(x, profile, visualize)  # single-scale inference, train
 
     def forward_augment(self, x):
         """
@@ -139,7 +138,7 @@ class Model(nn.Module):
             y.append(yi)
         return torch.cat(y, 1), None  # augmented inference, train
 
-    def forward_once(self, x, profile=False, feature_vis=False):
+    def forward_once(self, x, profile=False, visualize=False):
         y, dt = [], []  # 各层的输出,每层的耗时
         for m in self.model:
             if m.f != -1:  # 如果当前层的输入不是来自上一层
@@ -157,6 +156,9 @@ class Model(nn.Module):
 
             x = m(x)  # run 真正的forward
             y.append(x if m.i in self.save else None)  # 只将那些来自更早的层(from∈int但!=-1,一般来说没有)或会被cat的层的输出保存起来,其余为None
+
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
 
         if profile:
             logger.info('%.1fms total' % sum(dt))  # 总耗时

@@ -105,10 +105,10 @@ class Ensemble(nn.ModuleList):
     def __init__(self):
         super(Ensemble, self).__init__()
 
-    def forward(self, x, augment=False):
+    def forward(self, x, augment=False, profile=False, visualize=False):
         y = []
         for module in self:
-            y.append(module(x, augment)[0])  # 其中[1]是未与anchor与stride结合的原生prediction
+            y.append(module(x, augment, profile, visualize)[0])  # 其中[1]是未与anchor与stride结合的原生prediction
         # y = torch.stack(y).max(0)[0]  # max ensemble
         # y = torch.stack(y).mean(0)  # mean ensemble
         y = torch.cat(y, 1)  # nms ensemble

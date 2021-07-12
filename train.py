@@ -129,7 +129,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('训练模型加载比例 %g/%g 来自 %s' % (len(state_dict), len(model.state_dict()), weights))
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # 不依赖官方权重从零开始训练,但opt.cfg必须指定
+        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # 不依赖官方权重从零开始训练,但opt.cfg必须指定
     with torch_distributed_zero_first(RANK):
         check_dataset(data_dict)  # 检查数据是否存在
     train_path = data_dict['train']
@@ -464,8 +464,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     results, _, _ = test.run(data_dict,
                                              batch_size=batch_size // WORLD_SIZE * 2,
                                              imgsz=imgsz_test,
-                                             conf_thres=0.001,
-                                             iou_thres=0.7,
                                              model=attempt_load(m, device).half(),
                                              single_cls=single_cls,
                                              dataloader=testloader,
@@ -533,6 +531,7 @@ def main(opt):
         print(colorstr('train: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
         check_git_status()      # 检查git状态 是否非docker镜像 是否联网等,以及最终拉取最新版本的代码到本地
         check_requirements(exclude=['thop'])  # 检测相应的py版本及requirements.txt中依赖的库,如果缺少则安装,但exclude除外
+
     # 恢复训练,TODO 我不知道以下check_wandb_resume的意义何在,似乎与DDP(我没实际使用过)有关.以及其他机器上加载wandb上的权重与数据？
     wandb_run = check_wandb_resume(opt)
     if opt.resume and not wandb_run:  # 继续上一次中断了的训练
@@ -604,6 +603,8 @@ def main(opt):
 
         with open(opt.hyp) as f:
             hyp = yaml.safe_load(f)  # load hyps dict
+            if 'anchors' not in hyp:  # anchors commented in hyp.yaml
+                hyp['anchors'] = 3
         assert LOCAL_RANK == -1, 'DDP mode not implemented for --evolve'
         opt.notest, opt.nosave = True, True  # only test/save final epoch
         # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices

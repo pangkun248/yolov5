@@ -168,7 +168,8 @@ class ComputeLoss:
 
     def build_targets(self, p, targets):
         """
-        该方法实际就是先对对target repeat na次顺待附上对应的na索引
+        p: [16, 3, 80/2/4, 80/2/4, 85]  img_size:640*640 bs:16 nc:80
+        该方法实际就是先对对target repeat na次顺带附上对应的na索引
         再在不同feature map下生成不同的target
             1.将target_box放缩到fm尺寸(0,1)-> (0,fm)
             2.过滤与anchor同边比差异过大的target

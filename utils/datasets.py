@@ -22,15 +22,15 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.augmentations import augment_hsv, copy_paste, letterbox, mixup, random_perspective
+from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
 from utils.general import check_requirements, check_file, check_dataset, xywh2xyxy, xywhn2xyxy, xyxy2xywhn, \
     xyn2xy, segments2boxes, clean_str
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # 支持的图像后缀
-vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # 支持的视频后缀
+img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
+vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 num_threads = min(8, os.cpu_count())  # number of multiprocessing threads
 logger = logging.getLogger(__name__)
 
@@ -91,21 +91,21 @@ def exif_transpose(image):
 
 def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
                       rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix=''):
-    # 确保只有DDP中的第一个进程先处理数据集,后面的其他进程可以使用缓存
+    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
-                                      augment=augment,              # 数据增强
-                                      hyp=hyp,                      # 数据增强的超参数
-                                      rect=rect,                    # 矩形训练
-                                      cache_images=cache,           # 是否对图像进行缓存
-                                      single_cls=single_cls,        # 单类识别
+                                      augment=augment,  # augment images
+                                      hyp=hyp,  # augmentation hyperparameters
+                                      rect=rect,  # rectangular training
+                                      cache_images=cache,
+                                      single_cls=single_cls,
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)                # 输出的日志提示前缀  比如:colorstr('train: ')
+                                      prefix=prefix)
 
-    batch_size = min(batch_size, len(dataset))  # 主要是防止数据集过小,实际bs过大
-    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, workers])  # 开启的进程数
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
@@ -178,8 +178,8 @@ class LoadImages:  # for inference
             self.new_video(videos[0])  # new video
         else:
             self.cap = None
-        assert self.nf > 0, f'{p} 路径下,没有找到图片或视频. ' \
-                            f'支持的文件格式:\n图片: {img_formats}\n视频: {vid_formats}'
+        assert self.nf > 0, f'No images or videos found in {p}. ' \
+                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
 
     def __iter__(self):
         self.count = 0  # 注 该值为当前文件索引,一张图片算一个,一个视频源文件也只算一个
@@ -211,14 +211,14 @@ class LoadImages:  # for inference
             # 读取图片
             self.count += 1  # 文件索引+1
             img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, '图片不存在 ' + path
+            assert img0 is not None, 'Image Not Found ' + path
             print(f'image {self.count}/{self.nf} {path}: ', end='')
 
         # Padded resize
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR -> RGB, hwc->chw
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
         return path, img, img0, self.cap
@@ -264,7 +264,7 @@ class LoadWebcam:  # for inference
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB and HWC to CHW
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
         return img_path, img, img0, None
@@ -345,7 +345,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
         img = np.stack(img, 0)
 
         # Convert
-        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB and BHWC to BCHW
+        img = img[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
         img = np.ascontiguousarray(img)
 
         return self.sources, img, img0, None
@@ -387,29 +387,30 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # 如果相对->绝对路径
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
-                    raise Exception(f'{prefix}{p} 不存在')
+                    raise Exception(f'{prefix}{p} does not exist')
             self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
-            assert self.img_files, f'{prefix} 我的图图呢?'
+            assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # 检查缓存文件
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
-        if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load 当训练图片和标签有变动就重新生成cache
-            if cache.get('version') != 0.3 or cache.get('hash') != get_hash(self.label_files + self.img_files):
-                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
-        else:
+        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        try:
+            cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
+            assert cache['version'] == 0.4 and cache['hash'] == get_hash(self.label_files + self.img_files)
+        except:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
         # 展示缓存信息
         nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
         if exists:
-            d = f"正在扫描 '{cache_path}'中的图片和标签: 正常 {nf},丢失 {nm},无标注 {ne},重复 {nc}."
+            d = f"正在扫描 '{cache_path}'中的图片和标签: 正常 {nf},丢失 {nm},无标签 {ne},异常 {nc}."
             tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-        assert nf > 0 or not augment, f'{prefix}在{cache_path}中无标签,没有标签则无法训练.详情参考 {help_url}'
+            if cache['msgs']:
+                logging.info('\n'.join(cache['msgs']))  # display warnings
+        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
 
         # Read cache 下面移除的这三个值是为了方便zip函数.
         [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
@@ -484,19 +485,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     x[im_file] = [l, shape, segments]
                 if msg:
                     msgs.append(msg)
-                pbar.desc = f"{desc}{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+                pbar.desc = f"{desc}{nf} 正常, {nm} 丢失, {ne} 无标签, {nc} 异常"
 
         pbar.close()
         if msgs:
             logging.info('\n'.join(msgs))
         if nf == 0:
-            logging.info(f'{prefix}警告: 在目录{path}下没有发现标注文件. 详情参考 {help_url}')
+            logging.info(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, len(self.img_files)
         x['msgs'] = msgs  # warnings
-        x['version'] = 0.3  # cache version
+        x['version'] = 0.4  # cache version
         try:
-            torch.save(x, path)  # save cache for next time
+            np.save(path, x)  # save cache for next time
+            path.with_suffix('.cache.npy').rename(path)  # remove .npy suffix
             logging.info(f'{prefix}已创建新缓存文件: {path}')
         except Exception as e:
             logging.info(f'{prefix}警告: 缓存文件 {path.parent} 无法写入: {e}')  # 路径有问题
@@ -538,42 +540,43 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if labels.size:  # normalized xywh to pixel xyxy format  将label也根据pad进行修改
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-        if self.augment:
-            # Augment imagespace  这里与上面的load_mosaic中的random_perspective重复了.所以有这个if not
-            if not mosaic:
-                img, labels = random_perspective(img, labels,
+            if self.augment:
+                    img, labels = random_perspective(img, labels,
                                                  degrees=hyp['degrees'],
                                                  translate=hyp['translate'],
                                                  scale=hyp['scale'],
                                                  shear=hyp['shear'],
                                                  perspective=hyp['perspective'])
 
-            # Augment colorspace
+        nl = len(labels)  # number of labels
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
+
+        if self.augment:
+            # Albumentations
+            img, labels = self.albumentations(img, labels)
+
+            # HSV color-space
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
-            # Apply cutouts
+            # Flip up-down
+            if random.random() < hyp['flipud']:
+                img = np.flipud(img)
+                if nl:
+                    labels[:, 2] = 1 - labels[:, 2]
+
+            # Flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nl:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+            # Cutouts
             # if random.random() < 0.9:
             #     labels = cutout(img, labels)
 
-        nL = len(labels)  # number of labels
-        if nL:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0])  # xyxy to xywh normalized
-
-        if self.augment:
-            # flip up-down
-            if random.random() < hyp['flipud']:
-                img = np.flipud(img)
-                if nL:
-                    labels[:, 2] = 1 - labels[:, 2]
-
-            # flip left-right
-            if random.random() < hyp['fliplr']:
-                img = np.fliplr(img)
-                if nL:
-                    labels[:, 1] = 1 - labels[:, 1]
-
-        labels_out = torch.zeros((nL, 6))
-        if nL:
+        labels_out = torch.zeros((nl, 6))
+        if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
@@ -631,7 +634,7 @@ def load_image(self, index):
     if img is None:  # 未缓存
         path = self.img_files[index]
         img = cv2.imread(path)  # BGR
-        assert img is not None, '未发现图片 ' + path
+        assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # ratio
         if r != 1:  # 如果最大边长与当网络输入尺度不相等则按最大边长放缩到标准尺寸的比例缩放整张图片
@@ -894,9 +897,11 @@ def verify_image_label(args):
 
 def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False):
     """ Return dataset statistics dictionary with images and instances counts per split per class
-    Usage: from utils.datasets import *; dataset_stats('coco128.yaml', verbose=True)
+    Usage1: from utils.datasets import *; dataset_stats('coco128.yaml', verbose=True)
+    Usage2: from utils.datasets import *; dataset_stats('../datasets/coco128.zip', verbose=True)
+
     Arguments
-        path:           Path to data.yaml
+        path:           Path to data.yaml or data.zip (with data.yaml inside data.zip)
         autodownload:   Attempt to download dataset if not found locally
         verbose:        Print stats dictionary
     """
@@ -905,8 +910,20 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False):
         # Update labels to integer class and 6 decimal place floats
         return [[int(c), *[round(x, 6) for x in points]] for c, *points in labels]
 
-    with open(check_file(path)) as f:
+    def unzip(path):
+        # Unzip data.zip TODO: CONSTRAINT: path/to/abc.zip MUST unzip to 'path/to/abc/'
+        if str(path).endswith('.zip'):  # path is data.zip
+            assert os.system(f'unzip -q {path} -d {path.parent}') == 0, f'Error unzipping {path}'
+            data_dir = path.with_suffix('')  # dataset directory
+            return True, data_dir, list(data_dir.rglob('*.yaml'))[0]  # zipped, data_dir, yaml_path
+        else:  # path is data.yaml
+            return False, None, path
+
+    zipped, data_dir, yaml_path = unzip(Path(path))
+    with open(check_file(yaml_path)) as f:
         data = yaml.safe_load(f)  # data dict
+        if zipped:
+            data['path'] = data_dir  # TODO: should this be dir.resolve()?
     check_dataset(data, autodownload)  # download dataset if missing
     nc = data['nc']  # number of classes
     stats = {'nc': nc, 'names': data['names']}  # statistics dictionary
