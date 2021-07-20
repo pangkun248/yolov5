@@ -2,7 +2,6 @@
 
 import datetime
 import logging
-import math
 import os
 import platform
 import subprocess
@@ -11,6 +10,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
+import math
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -22,7 +22,7 @@ try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -31,10 +31,10 @@ def torch_distributed_zero_first(local_rank: int):
     Decorator to make all processes in distributed training wait for each local_master to do something.
     """
     if local_rank not in [-1, 0]:
-        torch.distributed.barrier()
+        dist.barrier()
     yield
     if local_rank == 0:
-        torch.distributed.barrier()
+        dist.barrier()
 
 
 def init_torch_seeds(seed=0):
@@ -50,6 +50,7 @@ def init_torch_seeds(seed=0):
 def date_modified(path=__file__):
     # return human-readable file modification date, i.e. '2021-3-26' 最后文件修改日期? 我将其修改为了本地现在时间.不过基本没区别
     # t = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
+    # return f'{t.year}-{t.month}-{t.day}'
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
@@ -63,9 +64,10 @@ def git_describe(path=Path(__file__).parent):  # path must be a directory
 
 
 def select_device(device='', batch_size=None):
-    # device = 'cpu' or '0' or '0,1,2,3' 根据传递的device设置可见GPU,如果没给则默认所有GPU都可见
-    s = f'YOLOv5 🚀 {date_modified() or git_describe()} torch {torch.__version__} '  # string
-    cpu = device.lower() == 'cpu'
+    # device = 'cpu' or '0' or '0,1,2,3'
+    s = f'YOLOv5 🚀 {git_describe() and date_modified()} torch {torch.__version__} '  # string
+    device = str(device).strip().lower().replace('cuda:', '')  # to string, 'cuda:0' to '0'
+    cpu = device == 'cpu'
     if cpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # force torch.cuda.is_available() = False
     elif device:  # non-cpu device requested
@@ -85,11 +87,11 @@ def select_device(device='', batch_size=None):
     else:
         s += 'CPU\n'
 
-    logger.info(s.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else s)  # emoji-safe
+    LOGGER.info(s.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else s)  # emoji-safe
     return torch.device('cuda:0' if cuda else 'cpu')
 
 
-def time_synchronized():
+def time_sync():
     # pytorch-accurate time
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -118,12 +120,12 @@ def profile(x, ops, n=100, device=None):
             flops = 0
 
         for _ in range(n):
-            t[0] = time_synchronized()
+            t[0] = time_sync()
             y = m(x)
-            t[1] = time_synchronized()
+            t[1] = time_sync()
             try:
                 _ = y.sum().backward()
-                t[2] = time_synchronized()
+                t[2] = time_sync()
             except:  # no backward method
                 t[2] = float('nan')
             dtf += (t[1] - t[0]) * 1000 / n  # ms per op forward
@@ -228,11 +230,11 @@ def model_info(model, verbose=False, img_size=640):
         img = torch.zeros((1, model.yaml.get('ch', 3), stride, stride), device=next(model.parameters()).device)  # input
         flops = profile(deepcopy(model), inputs=(img,), verbose=False)[0] / 1E9 * 2  # stride GFLOPs
         img_size = img_size if isinstance(img_size, list) else [img_size, img_size]  # expand if int/float
-        fs = ', %.1f GFLOPs for 640*640' % (flops * img_size[0] / stride * img_size[1] / stride)  # 640x640 GFLOPs
+        fs = ', %.1f GFLOPs for %s*%s' % (flops * img_size[0] / stride * img_size[1] / stride, *img_size)
     except (ImportError, Exception):
         fs = ''
 
-    logger.info(f"Model Summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    LOGGER.info(f"Model Summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
 
 
 def load_classifier(name='resnet101', n=2):

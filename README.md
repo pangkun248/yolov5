@@ -174,16 +174,6 @@ $ python train.py --data coco.yaml --cfg yolov5s.yaml --weights '' --batch-size 
 </div>  
 
 
-## <div align="center">Compete and Win</div>
-
-我们对我们首次举办的 Ultralytics YOLOv5 🚀 EXPORT 比赛感到非常激动,奖金 **$10,000**!  
-
-<p align="center">
-  <a href="https://github.com/ultralytics/yolov5/discussions/3213">
-  <img width="850" src="https://github.com/ultralytics/yolov5/releases/download/v1.0/banner-export-competition.png"></a>
-</p>
-
-
 ## <div align="center">Why YOLOv5</div>
 
 <p align="center"><img width="800" src="https://user-images.githubusercontent.com/26833433/114313216-f0a5e100-9af5-11eb-8445-c682b60da2e3.png"></p>

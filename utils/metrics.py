@@ -38,7 +38,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     nc = unique_classes.shape[0]  # 验证集中出现的类别总数
 
     # 创建P-R曲线,并计算每类的AP
-    px, py = np.linspace(0, 1, 1000), []  # for plotting  应该给py列表内部一些默认值?
+    px, py = np.linspace(0, 1, 1000), []  # for plotting
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     for ci, c in enumerate(unique_classes):  # 按类计算P R AP等信息
         i = pred_cls == c

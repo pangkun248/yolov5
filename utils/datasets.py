@@ -28,11 +28,10 @@ from utils.general import check_requirements, check_file, check_dataset, xywh2xy
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
-help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
-vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
-num_threads = min(8, os.cpu_count())  # number of multiprocessing threads
-logger = logging.getLogger(__name__)
+HELP_URL = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
+IMG_FORMATS = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
+VID_FORMATS = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
+NUM_THREADS = min(8, os.cpu_count())  # number of multiprocessing threads
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -164,8 +163,8 @@ class LoadImages:  # for inference
         else:
             raise Exception(f'ERROR: {p} does not exist')
 
-        images = [x for x in files if x.split('.')[-1].lower() in img_formats]  # [图片源路径,*i]
-        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]  # [视频路源径,*v]
+        images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]  # [图片源路径,*i]
+        videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]  # [视频路源径,*v]
         ni, nv = len(images), len(videos)
 
         self.img_size = img_size
@@ -179,7 +178,7 @@ class LoadImages:  # for inference
         else:
             self.cap = None
         assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
+                            f'Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}'
 
     def __iter__(self):
         self.count = 0  # 注 该值为当前文件索引,一张图片算一个,一个视频源文件也只算一个
@@ -389,11 +388,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
+            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS])
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
+            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
 
         # 检查缓存文件
         self.label_files = img2label_paths(self.img_files)  # labels
@@ -461,7 +460,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if cache_images:
             gb = 0  # 缓存图像所占的内存大小(单位:G)
             self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(num_threads).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))
+            results = ThreadPool(NUM_THREADS).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))
             pbar = tqdm(enumerate(results), total=n)
             for i, x in pbar:
                 self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
@@ -474,7 +473,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         x = {}  # dict
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages  丢失,存在,空,异常,警告
         desc = f"{prefix}正在扫描 '{path.parent / path.stem}' 下的图片和标签..."
-        with Pool(num_threads) as pool:
+        with Pool(NUM_THREADS) as pool:
             pbar = tqdm(pool.imap_unordered(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
                         desc=desc, total=len(self.img_files))
             for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
@@ -492,7 +491,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if msgs:
             logging.info('\n'.join(msgs))
         if nf == 0:
-            logging.info(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
+            logging.info(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, len(self.img_files)
         x['msgs'] = msgs  # warnings
@@ -573,8 +572,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     labels[:, 1] = 1 - labels[:, 1]
 
             # Cutouts
-            # if random.random() < 0.9:
-            #     labels = cutout(img, labels)
+            # labels = cutout(img, labels, p=0.5)
 
         labels_out = torch.zeros((nl, 6))
         if nl:
@@ -691,8 +689,8 @@ def load_mosaic(self, index):
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
     # Augment
-    img4, labels4, segments4 = copy_paste(img4, labels4, segments4, probability=self.hyp['copy_paste'])
-    # ↓(2*h,2*w,3)                     ↓(h,w,3)
+    img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp['copy_paste'])
+    # ↓(h,w,3)                         ↓(2*h,2*w,3)
     img4, labels4 = random_perspective(img4, labels4, segments4,
                                        degrees=self.hyp['degrees'],
                                        translate=self.hyp['translate'],
@@ -800,7 +798,7 @@ def extract_boxes(path='../datasets/coco128'):  # from utils.datasets import *; 
     files = list(path.rglob('*.*'))
     n = len(files)  # number of files
     for im_file in tqdm(files, total=n):
-        if im_file.suffix[1:] in img_formats:
+        if im_file.suffix[1:] in IMG_FORMATS:
             # image
             im = cv2.imread(str(im_file))[..., ::-1]  # BGR to RGB
             h, w = im.shape[:2]
@@ -836,7 +834,7 @@ def autosplit(path='../datasets/coco128/images', weights=(0.9, 0.1, 0.0), annota
         annotated_only:  Only use images with an annotated txt file
     """
     path = Path(path)  # images dir
-    files = sum([list(path.rglob(f"*.{img_ext}")) for img_ext in img_formats], [])  # image files only
+    files = sum([list(path.rglob(f"*.{img_ext}")) for img_ext in IMG_FORMATS], [])  # image files only
     n = len(files)  # number of files
     random.seed(0)  # for reproducibility
     indices = random.choices([0, 1, 2], weights=weights, k=n)  # assign each image to a split
@@ -861,7 +859,7 @@ def verify_image_label(args):
         im.verify()  # PIL verify  验证文件内容,确认文件是否损坏.
         shape = exif_size(im)  # image size  W,H
         assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
-        assert im.format.lower() in img_formats, f'invalid image format {im.format}'
+        assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
         if im.format.lower() in ('jpg', 'jpeg'):
             with open(im_file, 'rb') as f:
                 f.seek(-2, 2)

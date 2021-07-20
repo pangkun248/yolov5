@@ -32,7 +32,7 @@ from tqdm import tqdm
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
 
-import test  # for end-of-epoch mAP
+import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
@@ -49,7 +49,7 @@ from utils.metrics import fitness
 
 # DDP相关变量的设置  WORLD_SIZE为你的机器数量  RANK为当前机器在所有机器中的index(0,1,2..),-1为非DDP模式
 # 参考 https://zhuanlan.zhihu.com/p/86441879
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
@@ -59,9 +59,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
           ):
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, notest, nosave, workers, = \
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, = \
         opt.save_dir, opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-        opt.resume, opt.notest, opt.nosave, opt.workers
+        opt.resume, opt.noval, opt.nosave, opt.workers
 
     # 目录相关
     save_dir = Path(save_dir)
@@ -75,7 +75,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if isinstance(hyp, str):
         with open(hyp) as f:
             hyp = yaml.safe_load(f)  # load hyps dict
-    logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
+    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # 保存本次运行时的配置(参数与超参数)
     with open(save_dir / 'hyp.yaml', 'w') as f:
@@ -96,7 +96,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # TensorBoard 可视化
         if not evolve:
             prefix = colorstr('tensorboard: ')
-            logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
+            LOGGER.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             loggers['tb'] = SummaryWriter(str(save_dir))
 
         # W&B
@@ -127,13 +127,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # 所要加载的权重(加载权重与训练权重的交集)
         model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('训练模型加载比例 %g/%g 来自 %s' % (len(state_dict), len(model.state_dict()), weights))
+        LOGGER.info('训练模型加载比例 %g/%g 来自 %s' % (len(state_dict), len(model.state_dict()), weights))
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # 不依赖官方权重从零开始训练,但opt.cfg必须指定
     with torch_distributed_zero_first(RANK):
         check_dataset(data_dict)  # 检查数据是否存在
     train_path = data_dict['train']
-    test_path = data_dict['val']
+    val_path = data_dict['val']
 
     # Freeze  冻结某些层 但这里作者不推荐使用.因为无论如何都不会取得更好的性能(精度),除非显存受限
     freeze = []  # 冻结的参数名称 (全部或部分)
@@ -147,7 +147,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     nbs = 64  # 理论bs,也即batch_size累计到该数量时才进行梯度更新
     accumulate = max(round(nbs / batch_size), 1)  # 优化前的累积损失次数  total_batch_size -> 实际bs
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # 改变权重衰减系数,当实际bs<64时不变,否则x(实际bs/理论bs)
-    logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
+    LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
     # 简而言之就是conv的weight有hyp['weight_decay'],其他权重参数没有.其他方面都没区别 但是不清楚为什么要这样做,以及怎么想到这种方法的
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
@@ -166,7 +166,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases) 这里不明白为什么要把pg2单独放在一个group.明明和pg0一样的优化配置
-    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g bn.weight' % (len(pg2), len(pg1), len(pg0)))
+    LOGGER.info('Optimizer groups: %g .bias, %g conv.weight, %g bn.weight' % (len(pg2), len(pg1), len(pg0)))
     del pg0, pg1, pg2
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
@@ -204,7 +204,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if resume:
             assert start_epoch > 0, '%s 训练已结束(%g轮),已无法继续.' % (weights, epochs)
         if epochs < start_epoch:
-            logger.info('%s 已训练 %g 轮. 现额外微调 %g 轮.' %
+            LOGGER.info('%s 已训练 %g 轮. 现额外微调 %g 轮.' %
                         (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  # 更新训练的总轮数
 
@@ -213,7 +213,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Image sizes
     gs = max(int(model.stride.max()), 32)  # grid size (max stride) 除非魔改网络否则最大步长就是32
     nl = model.model[-1].nl  # 检测层的数量 (used for scaling hyp['obj'])
-    imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # 验证img_size是否是gs的整数倍
+    imgsz = check_img_size( opt.img_size, gs)  # 验证img_size是否是gs的整数倍
 
     # DP mode 单机多卡(不建议这使用该种模式,性能几乎没有提升.建议DDP)
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
@@ -223,34 +223,33 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # SyncBatchNorm 可参考 https://zh.mxnet.io/blog/syncbn#batch-normalization%E5%A6%82%E4%BD%95%E5%B7%A5%E4%BD%9C
     if opt.sync_bn and cuda and RANK != -1:
+        raise Exception('can not train with --sync-bn, known issue https://github.com/ultralytics/yolov5/issues/3998')
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        logger.info('Using SyncBatchNorm()')
+        LOGGER.info('Using SyncBatchNorm()')
 
     # 训练集  hyp为dict 来自 opt.hyp
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
+    train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=RANK,
                                             workers=workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
-    nb = len(dataloader)  # number of batches
+    nb = len(train_loader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, data, nc - 1)
 
     # Process 0
     if RANK in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size // WORLD_SIZE * 2, gs, single_cls,
-                                       hyp=hyp, cache=opt.cache_images and not notest, rect=True, rank=-1,
-                                       workers=workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+        val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
+                                       hyp=hyp, cache=opt.cache_images and not noval, rect=True, rank=-1,
+                                       workers=workers, pad=0.5,
+                                       prefix=colorstr('val: '))[0]
 
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
-            c = torch.tensor(labels[:, 0])  # classes
+            # c = torch.tensor(labels[:, 0])  # classes
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency 每个class出现的频率
             # model._initialize_biases(cf.to(device))  # 根据cls的频率初始化检测层的bias对应的各个cls的值
             if plots:
                 plot_labels(labels, names, save_dir, loggers)
-                if loggers['tb']:
-                    loggers['tb'].add_histogram('classes', c, 0)  # TensorBoard
 
             # Anchors  检查模型中的anchor是否与数据集想适应,否则利用k-means与遗传算法优化anchor
             if not opt.noautoanchor:
@@ -282,8 +281,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss = ComputeLoss(model)  # init loss class
-    logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
-                f'Using {dataloader.num_workers} dataloader workers\n'
+    LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
+                f'Using {train_loader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
@@ -309,9 +308,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         mloss = torch.zeros(4, device=device)  # mean losses
         if RANK != -1:
-            dataloader.sampler.set_epoch(epoch)  # 和shuffle有关 https://www.zhihu.com/question/67209417/answer/1017851899
-        pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
+            train_loader.sampler.set_epoch(epoch)  # shuffle https://www.zhihu.com/question/67209417/answer/1017851899
+        pbar = enumerate(train_loader)
+        LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar 只在主机上显示训练进度相关信息
         optimizer.zero_grad()
@@ -392,20 +391,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # mAP
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs  # 判断是否是最后一轮
-            if not notest or final_epoch:  # Calculate mAP
+            if not noval or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, _ = test.run(data_dict,
-                                            batch_size=batch_size // WORLD_SIZE * 2,
-                                            imgsz=imgsz_test,
-                                            model=ema.ema,
-                                            single_cls=single_cls,
-                                            dataloader=testloader,
-                                            save_dir=save_dir,
-                                            save_json=is_coco and final_epoch,
-                                            verbose=nc < 50 and final_epoch,
-                                            plots=plots and final_epoch,
-                                            wandb_logger=wandb_logger,
-                                            compute_loss=compute_loss)
+                results, maps, _ = val.run(data_dict,
+                                           batch_size=batch_size // WORLD_SIZE * 2,
+                                           imgsz=imgsz,
+                                           model=ema.ema,
+                                           single_cls=single_cls,
+                                           dataloader=val_loader,
+                                           save_dir=save_dir,
+                                           save_json=is_coco and final_epoch,
+                                           verbose=nc < 50 and final_epoch,
+                                           plots=plots and final_epoch,
+                                           wandb_logger=wandb_logger,
+                                           compute_loss=compute_loss)
 
             # Write
             with open(results_file, 'a') as f:
@@ -451,7 +450,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in [-1, 0]:
-        logger.info(f'{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.\n')
+        LOGGER.info(f'{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.\n')
         if plots:
             plot_results(save_dir=save_dir)  # save as results.png 将results.txt中的内容绘制成png图像
             if loggers['wandb']:
@@ -461,15 +460,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if not evolve:
             if is_coco:  # COCO dataset
                 for m in [last, best] if best.exists() else [last]:  # speed, mAP tests
-                    results, _, _ = test.run(data_dict,
-                                             batch_size=batch_size // WORLD_SIZE * 2,
-                                             imgsz=imgsz_test,
-                                             model=attempt_load(m, device).half(),
-                                             single_cls=single_cls,
-                                             dataloader=testloader,
-                                             save_dir=save_dir,
-                                             save_json=True,
-                                             plots=False)
+                    results, _, _ = val.run(data_dict,
+                                            batch_size=batch_size // WORLD_SIZE * 2,
+                                            imgsz=imgsz,
+                                            model=attempt_load(m, device).half(),
+                                            single_cls=single_cls,
+                                            dataloader=val_loader,
+                                            save_dir=save_dir,
+                                            save_json=True,
+                                            plots=False)
 
             # Strip optimizers
             for f in last, best:
@@ -489,15 +488,15 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default='data/skin.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
+    parser.add_argument('--batch-size', type=int, default=8, help='total batch size for all GPUs')
+    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
-    parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    parser.add_argument('--noval', action='store_true', help='only validate final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
     parser.add_argument('--evolve', type=int, nargs='?', const=300, help='evolve hyperparameters for x generations')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
@@ -540,14 +539,13 @@ def main(opt):
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
             opt = argparse.Namespace(**yaml.safe_load(f))  # 将上一次训练权重的超参数替换进现有的超参数
         opt.cfg, opt.weights, opt.resume = '', ckpt, True  # 恢复一些参数设置
-        logger.info('Resuming training from %s' % ckpt)
+        LOGGER.info(f'Resuming training from {ckpt}')
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
         opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # 检查文件是否指定或唯一
         # 模型与配置文件至少存在一个,否则网络无法定义
         # weights为空时,即从零开始训练此时需根据cfg即model.yaml来定义网络.weights不为空时,根据weights中内置的配置文件来定义网络
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
-        opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok or opt.evolve))
 
@@ -606,11 +604,11 @@ def main(opt):
             if 'anchors' not in hyp:  # anchors commented in hyp.yaml
                 hyp['anchors'] = 3
         assert LOCAL_RANK == -1, 'DDP mode not implemented for --evolve'
-        opt.notest, opt.nosave = True, True  # only test/save final epoch
+        opt.noval, opt.nosave = True, True  # only val/save final epoch
         # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
         yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml'  # save best result here
         if opt.bucket:
-            os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # 从谷歌云盘下载evolve.txt 如果存在的话
+            os.system(f'gsutil cp gs://{opt.bucket}/evolve.txt .')  # 从谷歌云盘下载evolve.txt 如果存在的话
 
         for _ in range(opt.evolve):  # 这里进化300次,但是每次都训练300epoch?
             if Path('evolve.txt').exists():  # 如果evolve.txt存在,选择最好的超参数并进化

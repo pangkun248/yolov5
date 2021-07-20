@@ -5,7 +5,6 @@ Usage:
 """
 
 import argparse
-import logging
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -18,7 +17,7 @@ from models.experimental import *
 from utils.autoanchor import check_anchor_order
 from utils.general import make_divisible, check_file, set_logging
 from utils.plots import feature_visualization
-from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
+from utils.torch_utils import time_sync, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
     select_device, copy_attr
 
 try:
@@ -26,7 +25,7 @@ try:
 except ImportError:
     thop = None
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 class Detect(nn.Module):
@@ -79,7 +78,7 @@ class Detect(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
-        super(Model, self).__init__()
+        super().__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
         else:  # is *.yaml
@@ -90,15 +89,15 @@ class Model(nn.Module):
         # 定义模型
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # 多变量赋值,如果配置中没有ch属性则默认为3
         if nc and nc != self.yaml['nc']:
-            logger.info(f"model.yaml中的类别数已更新 更新前:{self.yaml['nc']} 更新后:{nc}")
+            LOGGER.info(f"model.yaml中的类别数已更新 更新前:{self.yaml['nc']} 更新后:{nc}")
             self.yaml['nc'] = nc  # 覆盖yaml中的nc值
         if anchors:  # 如果anchors在模型初始化时指定,则更新进model.yaml中时anchors为int(未生成),否则为list(已生成)
-            logger.info(f'model.yaml中的anchors已被hyp文件的anchors已更新 更新后anchors={anchors}')
+            LOGGER.info(f'model.yaml中的anchors已被hyp文件的anchors已更新 更新后anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # 用hyp文件中的anchors(int)覆盖yaml中的anchors值 注!原始权重内置的anchors为list
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, 需要与其他层concat的层索引(绝对)
         self.names = [str(i) for i in range(self.yaml['nc'])]  # 暂时以各个类的"索引"为默认名称
         self.inplace = self.yaml.get('inplace', True)  # 是否原地修改操作,仅在Detect中.主要为了兼容 ONNX (因为ONNX暂不支持该操作)
-        # logger.info([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+        # LOGGER.info([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
@@ -110,12 +109,12 @@ class Model(nn.Module):
             check_anchor_order(m)  # 检查strides与anchors的一致性
             self.stride = m.stride
             self._initialize_biases()  # only run once
-            # logger.info('Strides: %s' % m.stride.tolist())
+            # LOGGER.info('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
         initialize_weights(self)
         self.info()  # 打印网络参数相关信息
-        logger.info('')
+        LOGGER.info('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
@@ -146,13 +145,13 @@ class Model(nn.Module):
 
             if profile:  # 统计相关层的耗时
                 o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
-                t = time_synchronized()
+                t = time_sync()
                 for _ in range(10):  # 循环10次,让速度趋于正常
                     _ = m(x)
-                dt.append((time_synchronized() - t) * 100)  # ms -> s 这里本应该x1000,但由于循环10次所以再除以10,所以最终x100
+                dt.append((time_sync() - t) * 100)  # ms -> s 这里本应该x1000,但由于循环10次所以再除以10,所以最终x100
                 if m == self.model[0]:
-                    logger.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
-                logger.info(f'{dt[-1]:10.2f} {o:10.2f} {m.n_p:10.0f}  {m.type}')
+                    LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
+                LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.n_p:10.0f}  {m.type}')
 
             x = m(x)  # run 真正的forward
             y.append(x if m.i in self.save else None)  # 只将那些来自更早的层(from∈int但!=-1,一般来说没有)或会被cat的层的输出保存起来,其余为None
@@ -161,7 +160,7 @@ class Model(nn.Module):
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
 
         if profile:
-            logger.info('%.1fms total' % sum(dt))  # 总耗时
+            LOGGER.info('%.1fms total' % sum(dt))  # 总耗时
         return x
 
     def _descale_pred(self, p, flips, scale, img_size):
@@ -197,20 +196,20 @@ class Model(nn.Module):
         m = self.model[-1]  # Detect() module
         for mi in m.m:  # from
             b = mi.bias.detach().view(m.na, -1).T  # conv.bias(255) to (3,85)
-            logger.info(
+            LOGGER.info(
                 ('%6g Conv2d.bias:' + '%10.3g' * 6) % (mi.weight.shape[1], *b[:5].mean(1).tolist(), b[5:].mean()))
 
     # def _print_weights(self):
     #     for m in self.model.modules():
     #         if type(m) is Bottleneck:
-    #             logger.info('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
+    #             LOGGER.info('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
 
-    def fuse(self):  # 合并 conv+bn -> conv
-        logger.info('Fusing layers... ')
+    def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+        LOGGER.info('Fusing layers... ')
         for m in self.model.modules():
             if type(m) is Conv and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                delattr(m, 'bn')  # remove bn
+                delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
         self.info()
         return self
@@ -230,9 +229,9 @@ class Model(nn.Module):
         return self
 
     def autoshape(self):  # add AutoShape module
-        logger.info('Adding AutoShape... ')
+        LOGGER.info('Adding AutoShape... ')
         m = AutoShape(self)  # wrap model
-        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # 复制属性
+        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
         return m
 
     def info(self, verbose=False, img_size=640):  # print model information
@@ -240,13 +239,12 @@ class Model(nn.Module):
 
 
 def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输入维度 默认为[3]
-    logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+    LOGGER.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # anchor的数量(每个yolo层)
     no = na * (nc + 5)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
-
         m = eval(m) if isinstance(m, str) else m  # 如果是strings则进行转义
         for j, a in enumerate(args):
             try:  # 这个 try是为了nearest转义之后未定义而报NameError所准备的
@@ -256,7 +254,7 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
 
         n = max(round(n * gd), 1) if n > 1 else n  # 模块的实际深度
         if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP,
-                 C3, C3TR]:
+                 C3, C3TR, C3SPP]:
             c1, c2 = ch[f], args[0]  # 输入维度 , 输出维度
             if c2 != no:  # 如果不是最终输出,则根据gw-width_multiple缩放系数来重新设定输出
                 c2 = make_divisible(c2 * gw, 8)
@@ -285,7 +283,7 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
         n_p = sum([x.numel() for x in m_.parameters()])  # number params 参数量
         m_.i, m_.f, m_.type, m_.n_p = i, f, t, n_p  # 模块索引, 输入索引, 模块类型, 模块参数量
         # 输出模型各个模块的相关信息 n这里其实已经被和depth_multiple作用之后嵌入到args中去了,实际大于1的n已经被修改为1了
-        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, n_p, t, args))
+        LOGGER.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, n_p, t, args))
         # 将from中除开-1层外的索引转换为(感觉多余,本来就是)绝对索引并按序返回,其实就是方便后续提取出相应索引层的输出以便与其他(-1)层输出concat
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
@@ -315,6 +313,5 @@ if __name__ == '__main__':
     # Tensorboard (not working https://github.com/ultralytics/yolov5/issues/2898)
     # from torch.utils.tensorboard import SummaryWriter
     # tb_writer = SummaryWriter('.')
-    # logger.info("Run 'tensorboard --logdir=models' to view tensorboard at http://localhost:6006/")
+    # LOGGER.info("Run 'tensorboard --logdir=models' to view tensorboard at http://localhost:6006/")
     # tb_writer.add_graph(torch.jit.trace(model, img, strict=False), [])  # add model graph
-    # tb_writer.add_image('test', img[0], dataformats='CWH')  # add model to tensorboard

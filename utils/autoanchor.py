@@ -55,7 +55,7 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     print(f'anchors/target = {aat:.2f}, Best Possible Recall (BPR) = {bpr:.4f}', end='')
     if bpr < 0.98:  # 重新生成anchor的阈值
         print('. 正在尝试改进anchors, 请等待...')
-        na = m.anchor_grid.numel() // 2  # anchor数量
+        na = m.anchor_grid.numel() // 2  # anchor总数量
         try:
             anchors = kmean_anchors(dataset, n=na, img_size=imgsz, thr=thr, gen=1000, verbose=False)
         except Exception as e:
@@ -169,7 +169,7 @@ def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=10
     for _ in pbar:
         v = np.ones(sh)
         while (v == 1).all():  # 进化直到发生变化(防止重复)
-            v = ((npr.random(sh) < mp) * npr.random() * npr.randn(*sh) * s + 1) .clip(0.3, 3.0)  # 最后限制进化范围
+            v = ((npr.random(sh) < mp) * random.random() * npr.randn(*sh) * s + 1) .clip(0.3, 3.0)  # 最后限制进化范围
         kg = (k.copy() * v).clip(min=2.0)  # 限制anchor的wh最小值
         fg = anchor_fitness(kg)  # 所有gt_box与最佳匹配anchor的S均值
         if fg > f:
