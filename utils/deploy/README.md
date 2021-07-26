@@ -26,7 +26,7 @@ ONNX->TensorRT
 
 静态输入 以[1,3,640,640]为例(不足640的边默认padding(value=114))
 
-|Model |TensorRT<br><sup>Speed-FP16|TensorRT<br><sup>mAP-FP16|TensorRT<br>Speed-INT8|TensorRT<br>mAP-INT8|
+|Model |TensorRT<br><sup>Speed-FP16|TensorRT<br><sup>mAP-FP16|TensorRT<br><sup>Speed-INT8|TensorRT<br><sup>mAP-INT8|
 |---          |--- |---      |---  |---                     |
 |YOLOv5s      |4.6ms|36.5     |4.3ms        |28.8        |
 |YOLOv5m      |6.5ms|44.1     |5.7ms        |33.1        |
