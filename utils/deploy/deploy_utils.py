@@ -1,5 +1,5 @@
 """
-该文件的方法主要是为了ONNX、TensorRT的inference准备的,大部分都是已有方法的numpy版本
+该文件的方法主要是为了ONNX、TensorRT、OpenVINO、DNN的inference准备的,大部分都是已有方法的numpy版本
 """
 import numpy as np
 import time
@@ -13,9 +13,8 @@ coco_list = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train
              'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
              'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
              'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
-             'cell phone',
-             'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
-             'hair drier', 'toothbrush']
+             'cell phone','microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+             'scissors', 'teddy bear', 'hair drier', 'toothbrush']
 
 
 def box_iou(box1, box2):

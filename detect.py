@@ -1,4 +1,6 @@
-"""Run inference with a YOLOv5 model on images, videos, directories, streams
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+Run inference on images, videos, directories, streams, etc.
 
 Usage:
     $ python path/to/detect.py --source path/to/img.jpg --weights yolov5s.pt --img 640
@@ -90,14 +92,14 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
 
     # Run inference
     if device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # 先运行一次(测试是否正常?)
+        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # 先运行一次(预热)
     t0 = time.time()
     for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # [0,255] -> [0,1]
         if img.ndimension() == 3:
-            img = img.unsqueeze(0)
+            img = img[None]
 
         # Inference
         t1 = time_sync()
@@ -146,7 +148,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
                     if save_img or save_crop or view_img:  # 将检测结果绘制到图像
                         c = int(cls)  # 类索引
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=line_thickness)
+                        im0 = plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_width=line_thickness)
                         if save_crop:  # 是否将检测结果截取出来保存
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
@@ -179,7 +181,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
 
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {save_dir}{s}")
+        print(f"Results saved to {colorstr('bold', save_dir)}{s}")
 
     if update:
         strip_optimizer(weights)  # 更新所有模型(清空所有训练信息,epoch设为-1等)

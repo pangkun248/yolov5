@@ -1,9 +1,3 @@
-"""
-显存不足 或者 申请显存大小与trt模型输出维度不一致
-PyCUDA WARNING: a clean-up operation failed (dead context maybe?)
-cuMemFree failed: an illegal memory access was encountered
-"""
-
 import numpy as np
 import tensorrt as trt
 import cv2
@@ -13,9 +7,9 @@ import pycuda.autoinit  # 这个不能删
 TRT_LOGGER = trt.Logger()
 
 from utils.datasets import letterbox
-from deploy_utils import process_np
+from ..deploy_utils import process_np
 from utils.general import scale_coords
-from deploy_utils import coco_list
+from ..deploy_utils import coco_list
 
 
 def load_engine(engine_path):
@@ -31,7 +25,7 @@ def inference_static(context,image_txt,input_size):
     output_shape = context.get_binding_shape(1)
     # 创建输出占位符
     buffer = np.empty(output_shape, dtype=np.float32)
-    # 分配输出内存
+    # 分配输出内存  ！！！该种输出格式要求将pt模型转换至onnx模型过程中 需要修改 yolo.py 参见 README
     d_output = cuda.mem_alloc(buffer.nbytes)
     bindings = [d_input, d_output]
     img_paths = open(image_txt,'r').readlines()
@@ -80,7 +74,7 @@ def inference_dynamic(context,image_txt,input_size):
         # 分配输入的内存. nbytes=prod(shape)*4
         d_input = cuda.mem_alloc(img.nbytes)
         output_shape = context.get_binding_shape(1)
-        # 创建三个输出占位符
+        # 创一个输出占位符 ！！！该种输出格式要求将pt模型转换至onnx模型过程中 需要修改 yolo.py 参见 README
         buffer = np.empty(output_shape, dtype=np.float32)
         # 分配输出内存
         d_output = cuda.mem_alloc(buffer.nbytes)

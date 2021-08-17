@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
-from deploy_utils import process_np
+from utils.deploy.deploy_utils import process_np
 from val import process_batch, save_one_json
 from pathlib import Path
 
@@ -28,7 +28,7 @@ def load_engine(engine_path):
         return runtime.deserialize_cuda_engine(f.read())
 
 
-def comp_mAP(trt_path, val_path, anno_json, cls_list):
+def calc_ap(trt_path, val_path, anno_json, cls_list):
     engine = load_engine(trt_path)
     context = engine.create_execution_context()
 
@@ -45,7 +45,6 @@ def comp_mAP(trt_path, val_path, anno_json, cls_list):
 
     img_list = open(val_path, 'r').readlines()
     for img_path in tqdm(img_list, desc=s):
-        # for targets, paths, shapes in tqdm(dataloader, desc=s):
         label_path = img_path.replace('images', 'labels').rsplit('.', maxsplit=1)[0] + '.txt'
         targets = np.fromfile(label_path, sep=' ').reshape(-1, 5)  # add bs dim
         img0 = cv2.imread(img_path.rstrip())
@@ -94,7 +93,7 @@ def comp_mAP(trt_path, val_path, anno_json, cls_list):
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # 将target_box -> x y x y -> padding剥离 -> 放缩回[w0,h0] -> clip
-                # scale_coords(img[si].shape[1:], tbox, shape, ratio_pad)  # native-space labels
+                # scale_coords(img[si].shape[1:], tbox, shape, ratio_pad)  #  这里tbox都是未经改变的所以不用处理
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
             else:
@@ -148,4 +147,4 @@ if __name__ == "__main__":
     val_txt = '/home/cmv/PycharmProjects/datasets/coco/val2017.txt'
     val_json = '/home/cmv/PycharmProjects/datasets/coco/annotations/instances_val2017.json'
     names = coco_list
-    comp_mAP(trt_path, val_txt, val_json, names)
+    calc_ap(trt_path, val_txt, val_json, names)

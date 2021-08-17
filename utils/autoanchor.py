@@ -1,4 +1,9 @@
-# Auto-anchor utils
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+Auto-anchor utils
+"""
+
+import random
 
 import numpy as np
 import torch
@@ -72,11 +77,11 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     print('')  # newline
 
 
-def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=1000, verbose=True):
-    """ 从训练数据中利用kmeans生成anchors
+def kmean_anchors(dataset='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=1000, verbose=True):
+    """ 从训练数据中利用k-means生成anchors
 
         Arguments:
-            path:       data.yaml的路径或者是加载了该路径的dict
+            dataset:    data.yaml的路径或者是加载了该路径的dict
             n:          生成anchor的个数
             img_size:   训练的输入尺寸
             thr:        训练阶段的anchor与target的同边差异阈值,小于该阈值意为差距过大 默认=4.0
@@ -121,13 +126,11 @@ def kmean_anchors(path='./data/coco128.yaml', n=9, img_size=640, thr=4.0, gen=10
             print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
         return k
 
-    if isinstance(path, str):  # *.yaml file
-        with open(path) as f:
+    if isinstance(dataset, str):  # *.yaml file
+        with open(dataset) as f:
             data_dict = yaml.safe_load(f)  # model dict
         from utils.datasets import LoadImagesAndLabels
         dataset = LoadImagesAndLabels(data_dict['train'], augment=True, rect=True)
-    else:
-        dataset = path  # dataset
 
     # 获取标注物体的wh
     shapes = img_size * dataset.shapes / dataset.shapes.max(1, keepdims=True)

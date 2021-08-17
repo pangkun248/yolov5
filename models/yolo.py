@@ -1,4 +1,6 @@
-"""YOLOv5-specific modules
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+YOLO-specific modules
 
 Usage:
     $ python path/to/models/yolo.py --cfg yolov5s.yaml
@@ -33,7 +35,7 @@ class Detect(nn.Module):
     onnx_dynamic = False  # ONNX 导出时输入维度是否是动态范围
 
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
-        super(Detect, self).__init__()
+        super().__init__()
         self.nc = nc  # 检测类别数
         self.no = nc + 5  # 每个anchor的输出维度
         self.nl = len(anchors)  # 检测层的数量
@@ -62,12 +64,12 @@ class Detect(nn.Module):
                     y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                    # 这里是由于 ONNX暂时不支持原地修改的操作,只能另赋值然后cat(未来应该会支持)
+                    # 这里是由于 OpenVINO TensorRT暂时不支持原地修改的操作,只能另赋值然后cat来代替
                     xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2)  # wh
                     y = torch.cat((xy, wh, y[..., 4:]), -1)
                 z.append(y.view(bs, -1, self.no))  # [bs,na,ny,nx,nc] -> [bs,na*ny*nx,no]
-        # 如果train则将x简单处理后直接返回,否则各个fm尺寸的x与相应的anchor与stride结合并cat后与x返回
+
         return x if self.training else (torch.cat(z, 1), x)
 
     @staticmethod
@@ -86,6 +88,7 @@ class Model(nn.Module):
             self.yaml_file = Path(cfg).name  # 这个变量貌似没有用处
             with open(cfg) as f:
                 self.yaml = yaml.safe_load(f)  # 从 'model.yaml' 加载的配置
+
         # 定义模型
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # 多变量赋值,如果配置中没有ch属性则默认为3
         if nc and nc != self.yaml['nc']:
@@ -152,7 +155,6 @@ class Model(nn.Module):
                 if m == self.model[0]:
                     LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
                 LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.n_p:10.0f}  {m.type}')
-
             x = m(x)  # run 真正的forward
             y.append(x if m.i in self.save else None)  # 只将那些来自更早的层(from∈int但!=-1,一般来说没有)或会被cat的层的输出保存起来,其余为None
 
@@ -206,25 +208,25 @@ class Model(nn.Module):
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         LOGGER.info('Fusing layers... ')
-        for m in self.model.modules():
-            if type(m) is Conv and hasattr(m, 'bn'):
+        for m in self.model.modules():  # 注:官方提供的s m l x 四个模型中的m只是单纯带权重的模块,比如Detect模块是没有任何属性变量的.但如果你自己训练一个模型是会有这些属性的
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
-                m.forward = m.fuseforward  # update forward
+                m.forward = m.forward_fuse  # update forward
         self.info()
         return self
 
     def nms(self, mode=True):  # add or remove NMS module
         present = type(self.model[-1]) is NMS  # last layer is NMS
         if mode and not present:  # mode=True 以及 model[-1] is not NMS  inference模式?
-            logger.info('Adding NMS... ')
+            LOGGER.info('Adding NMS... ')
             m = NMS()  # module
             m.f = -1  # from
             m.i = self.model[-1].i + 1  # index
             self.model.add_module(name='%s' % m.i, module=m)  # add
             self.eval()
         elif not mode and present:  # mode=False 以及 model[-1] is NMS  training模式?
-            logger.info('Removing NMS... ')
+            LOGGER.info('Removing NMS... ')
             self.model = self.model[:-1]  # remove
         return self
 
@@ -252,15 +254,15 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
             except NameError:
                 pass
 
-        n = max(round(n * gd), 1) if n > 1 else n  # 模块的实际深度
-        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP,
-                 C3, C3TR, C3SPP]:
+        n = n_ =max(round(n * gd), 1) if n > 1 else n  # 模块的实际深度
+        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost]:
             c1, c2 = ch[f], args[0]  # 输入维度 , 输出维度
             if c2 != no:  # 如果不是最终输出,则根据gw-width_multiple缩放系数来重新设定输出
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR]:
+            if m in [BottleneckCSP, C3, C3TR, C3Ghost]:
                 args.insert(2, n)  # 重复的次数
                 n = 1
         elif m is nn.BatchNorm2d:
@@ -282,8 +284,8 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
         t = str(m)[8:-2].replace('__main__.', '')  # module type 注! str(m)中貌似没有__main__,目前不知道这行代码的作用
         n_p = sum([x.numel() for x in m_.parameters()])  # number params 参数量
         m_.i, m_.f, m_.type, m_.n_p = i, f, t, n_p  # 模块索引, 输入索引, 模块类型, 模块参数量
-        # 输出模型各个模块的相关信息 n这里其实已经被和depth_multiple作用之后嵌入到args中去了,实际大于1的n已经被修改为1了
-        LOGGER.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, n_p, t, args))
+        # 输出模型各个模块的相关信息
+        LOGGER.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n_, n_p, t, args))
         # 将from中除开-1层外的索引转换为(感觉多余,本来就是)绝对索引并按序返回,其实就是方便后续提取出相应索引层的输出以便与其他(-1)层输出concat
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
@@ -297,6 +299,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--profile', action='store_true', help='profile model speed')
     opt = parser.parse_args()
     opt.cfg = check_file(opt.cfg)  # check file
     set_logging()
@@ -307,8 +310,9 @@ if __name__ == '__main__':
     model.train()
 
     # Profile
-    # img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 320, 320).to(device)
-    # y = model(img, profile=True)
+    if opt.profile:
+        img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
+        y = model(img, profile=True)
 
     # Tensorboard (not working https://github.com/ultralytics/yolov5/issues/2898)
     # from torch.utils.tensorboard import SummaryWriter

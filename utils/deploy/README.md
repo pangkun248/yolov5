@@ -5,9 +5,7 @@ ONNX->TensorRT
 
 由于v5Detect层输出时会有两个值,第一个为合并数据,第二个为未处理数据,在实际检测时不需要第二个数据
 
-所以转onnx时需要将返回值做如下修改 (torch.cat(z, 1), x) -> torch.cat(z, 1)
-
-更新时间 2021-07-26
+所以转onnx时需要将返回值做如下修改 (torch.cat(z, 1), x) -> torch.cat(z, 1) (这个对性能影响很小,只是为了inference时少写一些代码)
 
 硬件环境:RTX-2060 i7-10700 SSD 1T 内存-2666赫兹-16Gx1
 
@@ -33,28 +31,10 @@ ONNX->TensorRT
 |YOLOv5l      |8.5ms|47.7     |7.1ms        |38.1        |
 |YOLOv5x      |14.4ms|49.7    |10.4ms       |42.5        |
 
-以下是可能会出现的错误或警告
+[1,3,640,640] i7-10700 **无GPU** forward+post_process 计算方式: 1000次循环取平均 测试图片 /data/images/zidane.jpg
 
+|Model |PyTorch|ONNX|OpenVINO|OpenCV-DNN|
+|---          |--- |---      |---  |---                     |
+|YOLOv5s      |105ms|54ms     |86ms        |395ms        |
 
-1.[TensorRT] ERROR: FAILED_EXECUTION: std::exception
-
- [TensorRT] ERROR: safeContext.cpp (184) - Cudnn Error in configure: 7 (CUDNN_STATUS_MAPPING_ERROR)
-
-可能的原因:代码中存在torch.cuda.synchronize()
-
-2.ImportError: libnvinfer.so.7: cannot open shared object file: No such file or directory
-
-环境变量后添加LD_LIBRARY_PATH=你的TensorRT存放路径/lib (其中包括pycharm运行配置参数) 具体自行百度
-
-3.出现含有Mindims 或 Maxdims  或 < 或 > 等关键词的警告或错误信息
-
-则大概率是你的输入图片尺寸超出模型可接受范围了
-
-4.WARNING: Missing dynamic range for tensor
-
-将目录中的calib_yolo.bin删除即可
-
-5.PyCUDA WARNING: a clean-up operation failed (dead context maybe?)
-   cuMemFree failed: an illegal memory access was encountered
-
-实际inference图片尺寸大小与trt模型输出维度不一致
+注!ONNX支持动态输入尺寸,可以利用yolov5的rect inference,在zidane.jpg这样的图片上可达29ms,而PyTorch则为58ms

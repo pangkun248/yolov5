@@ -1,10 +1,13 @@
-# YOLOv5 image augmentation functions
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+Image augmentation functions
+"""
 
 import logging
+import math
 import random
 
 import cv2
-import math
 import numpy as np
 
 from utils.general import colorstr, segment2box, resample_segments, check_version
@@ -102,7 +105,7 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
 
-    # Scale ratio (new / old)
+    # Scale ratio (new / old) 当标准尺寸大于原始尺寸宽高时,且scaleup、auto、auto为False,那么不放缩图像尺寸,图像尺寸外标准区域填充114
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     if not scaleup:  # only scale down, do not scale up (for better val mAP) 只缩不放,难道放大会使图像失真而导致mAP下降?
         r = min(r, 1.0)
@@ -116,7 +119,7 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     elif scaleFill:  # stretch  不对短边做padding,img直接resize到new_shape
         dw, dh = 0.0, 0.0
         new_unpad = (new_shape[1], new_shape[0])
-        ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios  重新计算放缩比例
+        ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # (width, height) ratios  重新计算放缩比例
 
     dw /= 2  # divide padding into 2 sides 当dw或dh为奇数时,除以2之后就会变成x.5 然后下面有一个+-0.1并四舍五入的操作来防止这种情况
     dh /= 2
@@ -251,10 +254,10 @@ def cutout(im, labels, p=0.5):
         # create random masks 生成31个不同宽高的mask区域,并填充不同的值.假如mask区域与box的iou超过0.6则把box丢弃
         scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
         for s in scales:
-            mask_h = random.randint(1, int(h * s))
+            mask_h = random.randint(1, int(h * s))  # 生成随机mask区域
             mask_w = random.randint(1, int(w * s))
     
-            # box 随机生成的mask区域,并限制区域范围
+            # box限制区域范围
             xmin = max(0, random.randint(0, w) - mask_w // 2)
             ymin = max(0, random.randint(0, h) - mask_h // 2)
             xmax = min(w, xmin + mask_w)

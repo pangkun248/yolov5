@@ -1,0 +1,44 @@
+ONNX模型转至 xml与bin模型过程中可能出现的错误
+1.https://docs.openvinotoolkit.org/latest/openvino_docs_MO_DG_prepare_model_Model_Optimizer_FAQ.html
+
+DNN 模块
+
+报错1 Unknown backend identifier in function wrapMat
+解决参考:    修改net.setPreferableBackend中参数 DNN_BACKEND_INFERENCE_ENGINE  为 DNN_BACKEND_DEFAULT or DNN_BACKEND_OPENCV
+可能原因:    目前使用的OpenCV库中没有IR环境,自然无法利用IR引擎 cv2.__version__ == 4.x.x-OpenVINO-2021.x.x 为带有OpenVINO的OpenCV库
+获取方式:    通过源码编译的方式构建OpenVINO并设置环境变量之后就是带有IR引擎的OpencvVINNO的OpenCV库了
+相关参考:    https://codeleading.com/article/3039767119/
+           https://github.com/opencv/opencv/issues/17821
+           https://github.com/opencv/opencv/issues/17727
+
+报错2  (-215:Assertion failed) start <= (int)shape.size() && end <= (int)shape.size() && start <= end in function 'total'
+可能原因:    YOLOv5的Detect模块有后处理,dnn不支持.
+解决参考:    把三个Detect层的后处理放到dnn外面重写
+
+更多参考: https://blog.csdn.net/nihate/article/details/112731327#comments_14884604
+
+另 opencv中的dnn模块不支持动态输入
+
+TensorRT 相关的错误或警告
+1.[TensorRT] ERROR: FAILED_EXECUTION: std::exception
+
+[TensorRT] ERROR: safeContext.cpp (184) - Cudnn Error in configure: 7 (CUDNN_STATUS_MAPPING_ERROR)
+
+可能的原因:代码中存在torch.cuda.synchronize()
+
+2.ImportError: libnvinfer.so.7: cannot open shared object file: No such file or directory
+
+环境变量后添加LD_LIBRARY_PATH=你的TensorRT存放路径/lib (其中包括pycharm运行配置参数) 具体自行百度
+
+3.出现含有Mindims 或 Maxdims  或 < 或 > 等关键词的警告或错误信息
+
+则大概率是你的输入图片尺寸超出模型可接受范围了
+
+4.WARNING: Missing dynamic range for tensor
+
+将目录中的calib_yolo.bin删除即可
+
+5.PyCUDA WARNING: a clean-up operation failed (dead context maybe?)
+cuMemFree failed: an illegal memory access was encountered
+
+显存不足 或者 inference时申请显存大小与trt模型输出维度不一致

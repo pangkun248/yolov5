@@ -1,4 +1,7 @@
-# Google utils: https://cloud.google.com/storage/docs/reference/libraries
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+Download utils
+"""
 
 import os
 import platform
@@ -36,8 +39,8 @@ def safe_download(file, url, url2=None, min_bytes=1E0, error_msg=''):
         print('')
 
 
-def attempt_download(file, repo='ultralytics/yolov5'):
-    # 如果相应的文件不存在,则尝试从GitHub以及google云服务器上下载
+def attempt_download(file, repo='ultralytics/yolov5'):  # from utils.downloads import *; attempt_download()
+    # Attempt file download if does not exist
     file = Path(str(file).strip().replace("'", ''))
 
     if not file.exists():
@@ -50,7 +53,7 @@ def attempt_download(file, repo='ultralytics/yolov5'):
             return name
 
         # GitHub assets
-        file.parent.mkdir(parents=True, exist_ok=True)  # 创建父级目录 (如果需要的话)
+        file.parent.mkdir(parents=True, exist_ok=True)  # make parent dir (if required)
         try:
             response = requests.get(f'https://api.github.com/repos/{repo}/releases/latest').json()  # github api
             assets = [x['name'] for x in response['assets']]  # release assets, i.e. ['yolov5s.pt', 'yolov5m.pt', ...]
@@ -74,7 +77,7 @@ def attempt_download(file, repo='ultralytics/yolov5'):
 
 
 def gdrive_download(id='16TiPfZj7htmTyhntwcZyEEAejOUxuT6m', file='tmp.zip'):
-    # Downloads a file from Google Drive. from yolov5.utils.google_utils import *; gdrive_download()
+    # Downloads a file from Google Drive. from yolov5.utils.downloads import *; gdrive_download()
     t = time.time()
     file = Path(file)
     cookie = Path('cookie')  # gdrive cookie
@@ -115,6 +118,9 @@ def get_token(cookie="./cookie"):
                 return line.split()[-1]
     return ""
 
+# Google utils: https://cloud.google.com/storage/docs/reference/libraries ----------------------------------------------
+#
+#
 # def upload_blob(bucket_name, source_file_name, destination_blob_name):
 #     # Uploads a file to a bucket
 #     # https://cloud.google.com/storage/docs/uploading-objects#storage-upload-object-python

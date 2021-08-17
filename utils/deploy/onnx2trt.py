@@ -1,5 +1,5 @@
 import tensorrt as trt
-from calibrator import YOLOEntropyCalibrator
+from utils.deploy.TensorRT.calibrator import YOLOEntropyCalibrator
 import onnxruntime
 import os
 

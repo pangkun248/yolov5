@@ -1,4 +1,6 @@
-"""Validate a trained YOLOv5 model accuracy on a custom dataset
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+"""
+Validate a trained YOLOv5 model accuracy on a custom dataset
 
 Usage:
     $ python path/to/val.py --data coco128.yaml --weights yolov5s.pt --img 640
@@ -13,7 +15,6 @@ from threading import Thread
 
 import numpy as np
 import torch
-import yaml
 from tqdm import tqdm
 
 FILE = Path(__file__).absolute()
@@ -26,6 +27,7 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_file, che
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_sync
+from utils.callbacks import Callbacks
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -40,7 +42,7 @@ def save_one_txt(predn, save_conf, shape, file):
 
 def save_one_json(predn, jdict, path, class_map):
     # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    image_id = int(path.stem) if path.stem.isnumeric() else path.stem  # image_id 不一定要int
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
     for p, b in zip(predn.tolist(), box.tolist()):
@@ -50,27 +52,27 @@ def save_one_json(predn, jdict, path, class_map):
                       'score': round(p[4], 5)})
 
 
-def process_batch(predictions, labels, iouv):
-    # Evaluate 1 batch of predictions 生成针对pred_boxes的各IoU阈值矩阵 -> 每张图片
-    correct = torch.zeros(predictions.shape[0], len(iouv), dtype=torch.bool, device=iouv.device)
-    detected = []  # label indices
-    tcls, pcls = labels[:, 0], predictions[:, 5]
-    nl = labels.shape[0]  # number of labels
-    for cls in torch.unique(tcls):
-        ti = (cls == tcls).nonzero().view(-1)  # label indices target_cls==cls 的target_ind
-        pi = (cls == pcls).nonzero().view(-1)  # prediction indices pred_cls==cls 的pred_ind
-        if pi.shape[0]:  # find detections
-            # 1_prediction vs n_target 此时的pred是经过nms后的,所以其conf也是从大到小排序的
-            ious, i = box_iou(predictions[pi, 0:4], labels[ti, 1:5]).max(1)  # best ious, indices
-            detected_set = set()
-            for j in (ious > iouv[0]).nonzero(): # 满足 IoU值大于最低(0.5)的那些pred_ind
-                d = ti[i[j]]  # 当前labels中的索引(labels_ind) <- 最大IoU值的target_ind <- 满足IoU条件的pred_ind
-                if d.item() not in detected_set:  # 一个target_box只能对应一个pred_box,conf高的优先
-                    detected_set.add(d.item())
-                    detected.append(d)  # append detections
-                    correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn 大于最低IoU阈值的 是否大于0.5~0.95各个IoU阈值
-                    if len(detected) == nl:  # 已检测到所有target_box数量如果和实际target_box一致则直接进行下一张图片
-                        break
+def process_batch(detections, labels, iouv):
+    """
+    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
+    Arguments:
+        detections (Array[N, 6]), x1, y1, x2, y2, conf, class
+        labels (Array[M, 5]), class, x1, y1, x2, y2
+    Returns:
+        correct (Array[N, 10]), for 10 IoU levels
+    """
+    correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
+    iou = box_iou(labels[:, 1:], detections[:, :4])
+    x = torch.where((iou >= iouv[0]) & (labels[:, 0:1] == detections[:, 5]))  # IoU above threshold and classes match
+    if x[0].shape[0]:
+        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
+        if x[0].shape[0] > 1:
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            # matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        matches = torch.Tensor(matches).to(iouv.device)
+        correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
     return correct
 
 
@@ -98,7 +100,7 @@ def run(data,
         dataloader=None,
         save_dir=Path(''),
         plots=True,
-        wandb_logger=None,
+        callbacks=Callbacks(),
         compute_loss=None,
         ):
     # Initialize/load model and set device
@@ -123,9 +125,7 @@ def run(data,
         #     model = nn.DataParallel(model)
 
         # Data
-        with open(data) as f:
-            data = yaml.safe_load(f)
-        check_dataset(data)  # check
+        data = check_dataset(data)  # check
 
     # Half
     half &= device.type != 'cpu'  # half precision only supported on CUDA
@@ -171,7 +171,7 @@ def run(data,
 
         # Compute loss
         if compute_loss:
-            loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+            loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
         # Run NMS 此时的target是在标准尺寸下的坐标
         targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
@@ -218,9 +218,8 @@ def run(data,
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...]
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            if wandb_logger and wandb_logger.wandb_run:
-                wandb_logger.val_one_image(pred, predn, path, names, img[si])
-            # image end-------------------------------------------------------------------------------------------------
+            callbacks.on_val_image_end(pred, predn, path, names, img[si])
+
         # Plot images 只绘制前三个batch
         if plots and batch_i < 3:
             f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
@@ -256,9 +255,7 @@ def run(data,
     # 是否绘制混淆矩阵
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        if wandb_logger and wandb_logger.wandb:
-            val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.jpg'))]
-            wandb_logger.log({"Validation": val_batches})
+        callbacks.on_val_end()
 
     # 是否将检测结果保存为COCO格式的JSON文件
     if save_json and len(jdict):
@@ -290,7 +287,7 @@ def run(data,
     model.float()  # for training
     if not training:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {save_dir}{s}")
+        print(f"Results saved to {colorstr('bold', save_dir)}{s}")
     maps = np.zeros(nc) + map  # 创建一个默认初始值为mAP的所有类AP
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]  # 统计那些出现在验证集中的类,获取其AP值并赋予maps上
@@ -328,7 +325,7 @@ def parse_opt():
 def main(opt):
     set_logging()
     print(colorstr('val: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
-    check_requirements(exclude=('tensorboard', 'thop'))
+    check_requirements(requirements=FILE.parent / 'requirements.txt', exclude=('tensorboard', 'thop'))
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         run(**vars(opt))
