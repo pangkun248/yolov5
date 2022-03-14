@@ -182,10 +182,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
-    if opt.linear_lr:
-        lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    else:
+    if opt.cos_lr:
         lf = one_cycle(1, hyp['lrf'], epochs)  # 相对:cosine 1->hyp['lrf']  绝对:lr0->lr0*lrf  T=epochs lr趋势cos[0,π]
+    else:
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # from utils.plots import plot_lr_scheduler
     # plot_lr_scheduler(optimizer, scheduler, epochs)
@@ -274,8 +274,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     model.names = names
 
     # Start training
-    t0 = time.time()
-    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    t0 = time.time()  # Update min warmup iterations from 1k to 100,Based on VOC results at larger batch sizes.
+    nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training 同时将iter限制在剩余iter/2以内
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
@@ -360,6 +360,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, opt.sync_bn)
+                if callbacks.stop_training:
+                    return
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -523,18 +525,20 @@ def main(opt, callbacks=Callbacks()):
         # weights为空时,即从零开始训练此时需根据cfg即model.yaml来定义网络.weights不为空时,根据weights中内置的配置文件来定义网络
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         if opt.evolve:
-            opt.project = str(ROOT / 'runs/evolve')
+            if opt.project == str(ROOT / 'runs/train'):  # if default project name, rename to runs/evolve
+                opt.project = str(ROOT / 'runs/evolve')
             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
     # DDP模式 相关的参数配置(涉及到多卡时) 参考 https://pytorch.org/docs/stable/notes/cuda.html#cuda-nn-ddp-instead
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
-        from datetime import timedelta
+        msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
+        assert not opt.image_weights, f'--image-weights {msg}'
+        assert not opt.evolve, f'--evolve {msg}'
+        assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
+        assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
         assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
-        assert opt.batch_size % WORLD_SIZE == 0, '--batch-size must be multiple of CUDA device count'
-        assert not opt.image_weights, '--image-weights argument is not compatible with DDP training'
-        assert not opt.evolve, '--evolve argument is not compatible with DDP training'
         torch.cuda.set_device(LOCAL_RANK)
         device = torch.device('cuda', LOCAL_RANK)
         dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
@@ -624,7 +628,7 @@ def main(opt, callbacks=Callbacks()):
 
             # Train mutation
             results = train(hyp.copy(), opt, device, callbacks)
-
+            callbacks = Callbacks()
             # 将每次演化之后的最优结果(hyp和"mAP")更新到yaml及"evolve.csv"文件中去
             print_mutation(results, hyp.copy(), save_dir, opt.bucket)
 
@@ -641,6 +645,7 @@ def run(**kwargs):
     for k, v in kwargs.items():
         setattr(opt, k, v)
     main(opt)
+    return opt
 
 
 if __name__ == "__main__":
