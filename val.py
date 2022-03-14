@@ -3,7 +3,19 @@
 Validate a trained YOLOv5 model accuracy on a custom dataset
 
 Usage:
-    $ python path/to/val.py --data coco128.yaml --weights yolov5s.pt --img 640
+    $ python path/to/val.py --weights yolov5s.pt --data coco128.yaml --img 640
+
+Usage - formats:
+    $ python path/to/val.py --weights yolov5s.pt                 # PyTorch
+                                      yolov5s.torchscript        # TorchScript
+                                      yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
+                                      yolov5s.xml                # OpenVINO
+                                      yolov5s.engine             # TensorRT
+                                      yolov5s.mlmodel            # CoreML (MacOS-only)
+                                      yolov5s_saved_model        # TensorFlow SavedModel
+                                      yolov5s.pb                 # TensorFlow GraphDef
+                                      yolov5s.tflite             # TensorFlow Lite
+                                      yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
 """
 
 import argparse
@@ -17,17 +29,21 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-FILE = Path(__file__).absolute()
-sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]  # YOLOv5 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.experimental import attempt_load
-from utils.datasets import create_dataloader
-from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
-    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
-from utils.metrics import ap_per_class, ConfusionMatrix
-from utils.plots import plot_images, output_to_target, plot_study_txt
-from utils.torch_utils import select_device, time_sync
+from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
+from utils.datasets import create_dataloader
+from utils.general import (LOGGER, box_iou, check_dataset, check_img_size, check_requirements, check_yaml,
+                           coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
+                           scale_coords, xywh2xyxy, xyxy2xywh)
+from utils.metrics import ConfusionMatrix, ap_per_class
+from utils.plots import output_to_target, plot_images, plot_val_study
+from utils.torch_utils import select_device, time_sync
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -85,6 +101,7 @@ def run(data,
         iou_thres=0.6,  # NMS IoU threshold
         task='val',  # train, val, test, speed or study
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
+        workers=8,  # max dataloader workers (per RANK in DDP mode)
         single_cls=False,  # treat as single-class dataset
         augment=False,  # augmented inference
         verbose=False,  # verbose output
@@ -92,10 +109,11 @@ def run(data,
         save_hybrid=False,  # save label+prediction hybrid results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
         save_json=False,  # save a COCO-JSON results file
-        project='runs/val',  # save to project/name
+        project=ROOT / 'runs/val',  # save to project/name
         name='exp',  # save to project/name
         exist_ok=False,  # existing project/name ok, do not increment
         half=True,  # use FP16 half-precision inference
+        dnn=False,  # use OpenCV DNN for ONNX inference
         model=None,
         dataloader=None,
         save_dir=Path(''),
@@ -106,8 +124,10 @@ def run(data,
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
-        device = next(model.parameters()).device  # get model device
+        device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
 
+        half &= device.type != 'cpu'  # half precision only supported on CUDA
+        model.half() if half else model.float()
     else:  # called directly
         device = select_device(device, batch_size=batch_size)
 
@@ -115,77 +135,80 @@ def run(data,
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)
 
-        # 加载模型
-        model = attempt_load(weights, map_location=device)  # load FP32 model
-        gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-        imgsz = check_img_size(imgsz, s=gs)  # 检查输入尺寸是否正确,如不正确则修正它
-
-        # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
-        # if device.type != 'cpu' and torch.cuda.device_count() > 1:
-        #     model = nn.DataParallel(model)
+        # Load model
+        model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data)
+        stride, pt, jit, onnx, engine = model.stride, model.pt, model.jit, model.onnx, model.engine
+        imgsz = check_img_size(imgsz, s=stride)  # check image size
+        half &= (pt or jit or onnx or engine) and device.type != 'cpu'  # FP16 supported on limited backends with CUDA
+        if pt or jit:
+            model.model.half() if half else model.model.float()
+        elif engine:
+            batch_size = model.batch_size
+        else:
+            half = False
+            batch_size = 1  # export.py models default to batch-size 1
+            device = torch.device('cpu')
+            LOGGER.info(f'Forcing --batch-size 1 square inference shape(1,3,{imgsz},{imgsz}) for non-PyTorch backends')
 
         # Data
         data = check_dataset(data)  # check
 
-    # Half
-    half &= device.type != 'cpu'  # half precision only supported on CUDA
-    if half:
-        model.half()
-
     # Configure
     model.eval()
-    is_coco = type(data['val']) is str and data['val'].endswith('coco/val2017.txt')  # COCO dataset
+    is_coco = isinstance(data.get('val'), str) and data['val'].endswith('coco/val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
     if not training:
-        if device.type != 'cpu':
-            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+        model.warmup(imgsz=(1, 3, imgsz, imgsz), half=half)  # warmup
+        pad = 0.0 if task == 'speed' else 0.5
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, single_cls, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '))[0]
+        dataloader = create_dataloader(data[task], imgsz, batch_size, stride, single_cls, pad=pad, rect=pt,
+                                       workers=workers, prefix=colorstr(f'{task}: '))[0]
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
-    p, r, f1, mp, mr, map50, map, t0, t1, t2 = 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
-        t_ = time_sync()
-        img = img.to(device, non_blocking=True)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        targets = targets.to(device)
-        nb, _, height, width = img.shape  # batch size, channels, height, width
-        t = time_sync()
-        t0 += t - t_
+    pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+        t1 = time_sync()
+        if pt or jit or engine:
+            im = im.to(device, non_blocking=True)
+            targets = targets.to(device)
+        im = im.half() if half else im.float()  # uint8 to fp16/32
+        im /= 255  # 0 - 255 to 0.0 - 1.0
+        nb, _, height, width = im.shape  # batch size, channels, height, width
+        t2 = time_sync()
+        dt[0] += t2 - t1
 
-        # Run model
-        out, train_out = model(img, augment=augment)  # inference and training outputs
-        t1 += time_sync() - t
+        # Inference
+        out, train_out = model(im) if training else model(im, augment=augment, val=True)  # inference, loss outputs
+        dt[1] += time_sync() - t2
 
-        # Compute loss
+        # Loss
         if compute_loss:
             loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
-        # Run NMS 此时的target是在标准尺寸下的坐标
+        # NMS 此时的target是在标准尺寸下的坐标
         targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-        t = time_sync()  # 此时out(经过了nms)是在标准图片尺寸下(与target一致) x1 y1 x2 y2 conf cls_ind [[n,6],*bs]
+        t3 = time_sync()  # 此时out(经过了nms)是在标准图片尺寸下(与target一致) x1 y1 x2 y2 conf cls_ind [[n,6],*bs]
         out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
-        t2 += time_sync() - t
+        dt[2] += time_sync() - t3
 
         # Statistics per image 每张图片的统计数据
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]  # target及labels是在标准尺寸下的,x y w h
             nl = len(labels)  # 该张图片的label数量
             tcls = labels[:, 0].tolist() if nl else []  # target class 该张图片的类list
-            path, shape = Path(paths[si]), shapes[si][0]  # 该张图片的路径
+            path, shape = Path(paths[si]), shapes[si][0]  # 该张图片的路径v 该张图片的原始尺寸
             seen += 1  # 已处理的图片数量
 
             if len(pred) == 0:
@@ -197,12 +220,12 @@ def run(data,
             if single_cls:  # 如果是单类检测,则强制检测结果cls_ind=0 改变了out中的值
                 pred[:, 5] = 0
             predn = pred.clone()  # c,h,w   x1 y1 x2 y2  (h0, w0),      ((h / h0, w / w0), pad) clone不共享内存,但共享梯度
-            scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # 去padding-> 放缩回[w0,h0]-> clip
+            scale_coords(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # 去padding-> 放缩回[w0,h0]-> clip
 
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # 将target_box -> x y x y -> padding剥离 -> 放缩回[w0,h0] -> clip
-                scale_coords(img[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
@@ -218,51 +241,51 @@ def run(data,
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...]
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.on_val_image_end(pred, predn, path, names, img[si])
+            callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
 
         # Plot images 只绘制前三个batch
         if plots and batch_i < 3:
             f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
+            Thread(target=plot_images, args=(im, targets, paths, f, names), daemon=True).start()
             f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+            Thread(target=plot_images, args=(im, output_to_target(out), paths, f, names), daemon=True).start()
         # batch end-----------------------------------------------------------------------------------------------------
     # 根据这些统计信息计算相关性能指标 [pn,10] [pn,] [pn,] [tn] pn->测试集所有的检测结果的总数 tn->测试集所有的标注目标的总数
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():  # 如果IoU矩阵不为空(至少有一个预测目标),且存在一个与target_box的IoU值大于0.5的
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
+        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
 
-    # 输出整体结果
-    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # 输出格式
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    # Print results
+    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
 
     # 输出每类结果(验证集中出现过的类)
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):  # c是指该类在检测类别中的索引. 而i是指验证集类别索引,因为 p、r ap、f1都是基于此的
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+            LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
 
-    # 输出速度相关指标  t0指的是预处理,t1指的是前向传播,t2指的是nms
-    t = tuple(x / seen * 1E3 for x in (t0, t1, t2))  # speeds per image
+    # 输出速度相关指标  t0指的是预处理,t1指的是前向传播,t2指的是nms TODO
+    t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
     if not training:
         shape = (batch_size, 3, imgsz, imgsz)
-        print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
+        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
 
     # 是否绘制混淆矩阵
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        callbacks.on_val_end()
+        callbacks.run('on_val_end')
 
     # 是否将检测结果保存为COCO格式的JSON文件
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
-        print(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
+        LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
 
@@ -281,13 +304,13 @@ def run(data,
             eval.summarize()
             map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
         except Exception as e:
-            print(f'pycocotools unable to run: {e}')
+            LOGGER.info(f'pycocotools unable to run: {e}')
 
     # Return results
     model.float()  # for training
     if not training:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {colorstr('bold', save_dir)}{s}")
+        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     maps = np.zeros(nc) + map  # 创建一个默认初始值为mAP的所有类AP
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]  # 统计那些出现在验证集中的类,获取其AP值并赋予maps上
@@ -295,15 +318,16 @@ def run(data,
 
 
 def parse_opt():
-    parser = argparse.ArgumentParser(prog='val.py')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, default=ROOT / 'data/wenyi.yaml', help='dataset.yaml path')
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT /'runs'/'train'/'exp2'/ 'weights'/'best.pt', help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--verbose', action='store_true', help='report mAP by class')
@@ -311,44 +335,48 @@ def parse_opt():
     parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-json', action='store_true', help='save a COCO-JSON results file')
-    parser.add_argument('--project', default='runs/val', help='save to project/name')
+    parser.add_argument('--project', default=ROOT / 'runs/val', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
+    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     opt = parser.parse_args()
+    opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.save_txt |= opt.save_hybrid
-    opt.data = check_file(opt.data)  # check file
+    print_args(FILE.stem, opt)
     return opt
 
 
 def main(opt):
-    set_logging()
-    print(colorstr('val: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
-    check_requirements(requirements=FILE.parent / 'requirements.txt', exclude=('tensorboard', 'thop'))
+    check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
 
     if opt.task in ('train', 'val', 'test'):  # run normally
+        if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
+            LOGGER.info(f'WARNING: confidence threshold {opt.conf_thres} >> 0.001 will produce invalid mAP values.')
         run(**vars(opt))
 
-    elif opt.task == 'speed':  # speed benchmarks
-        for w in opt.weights if isinstance(opt.weights, list) else [opt.weights]:
-            run(opt.data, weights=w, batch_size=opt.batch_size, imgsz=opt.imgsz, conf_thres=.25, iou_thres=.45,
-                save_json=False, plots=False)
+    else:
+        weights = opt.weights if isinstance(opt.weights, list) else [opt.weights]
+        opt.half = True  # FP16 for fastest results
+        if opt.task == 'speed':  # speed benchmarks
+            # python val.py --task speed --data coco.yaml --batch 1 --weights yolov5n.pt yolov5s.pt...
+            opt.conf_thres, opt.iou_thres, opt.save_json = 0.25, 0.45, False
+            for opt.weights in weights:
+                run(**vars(opt), plots=False)
 
-    elif opt.task == 'study':  # run over a range of settings and save/plot
-        # python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5s.pt yolov5m.pt yolov5l.pt yolov5x.pt
-        x = list(range(256, 1536 + 128, 128))  # x axis (image sizes)
-        for w in opt.weights if isinstance(opt.weights, list) else [opt.weights]:
-            f = f'study_{Path(opt.data).stem}_{Path(w).stem}.txt'  # filename to save to
-            y = []  # y axis
-            for i in x:  # img-size
-                print(f'\nRunning {f} point {i}...')
-                r, _, t = run(opt.data, weights=w, batch_size=opt.batch_size, imgsz=i, conf_thres=opt.conf_thres,
-                              iou_thres=opt.iou_thres, save_json=opt.save_json, plots=False)
-                y.append(r + t)  # results and times
-            np.savetxt(f, y, fmt='%10.4g')  # save
-        os.system('zip -r study.zip study_*.txt')
-        plot_study_txt(x=x)  # plot
+        elif opt.task == 'study':  # speed vs mAP benchmarks
+            # python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5n.pt yolov5s.pt...
+            for opt.weights in weights:
+                f = f'study_{Path(opt.data).stem}_{Path(opt.weights).stem}.txt'  # filename to save to
+                x, y = list(range(256, 1536 + 128, 128)), []  # x axis (image sizes), y axis
+                for opt.imgsz in x:  # img-size
+                    LOGGER.info(f'\nRunning {f} --imgsz {opt.imgsz}...')
+                    r, _, t = run(**vars(opt), plots=False)
+                    y.append(r + t)  # results and times
+                np.savetxt(f, y, fmt='%10.4g')  # save
+            os.system('zip -r study.zip study_*.txt')
+            plot_val_study(x=x)  # plot
 
 
 if __name__ == "__main__":
