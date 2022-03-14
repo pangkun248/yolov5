@@ -11,23 +11,23 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-FILE = Path(__file__).absolute()
-sys.path.append(FILE.parents[1].as_posix())  # add yolov5/ to path
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]  # YOLOv5 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+# ROOT = ROOT.relative_to(Path.cwd())  # relative
 
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
-from utils.general import make_divisible, check_file, set_logging
+from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
-from utils.torch_utils import time_sync, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
-    select_device, copy_attr
+from utils.torch_utils import fuse_conv_and_bn, initialize_weights, model_info, scale_img, select_device, time_sync
 
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
-
-LOGGER = logging.getLogger(__name__)
 
 
 class Detect(nn.Module):
@@ -41,10 +41,9 @@ class Detect(nn.Module):
         self.nl = len(anchors)  # 检测层的数量
         self.na = len(anchors[0]) // 2  # 每个检测层anchor的数量
         self.grid = [torch.zeros(1)] * self.nl  # 初始化grid
-        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
-        self.register_buffer('anchors', a)  # 可参考 https://blog.csdn.net/weixin_38145317/article/details/104917218
-        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # 普通的1x1降维卷积
+        self.anchor_grid = [torch.zeros(1)] * self.nl  # init anchor grid
+        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv 普通的1x1降维卷积
         self.inplace = inplace  # use in-place ops (e.g. slice assignment)
 
     def forward(self, x):
@@ -56,26 +55,32 @@ class Detect(nn.Module):
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4] or self.onnx_dynamic:  # 当dynamic参数开启时,每个grid都要临时新建
-                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)  # (1,1,ny,nx,2)
+                if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:  # 当dynamic参数开启时,每个grid都要临时新建
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
                 y = x[i].sigmoid()
                 if self.inplace:
-                    y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy [-0.5,1.5]
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh 最大四倍anchor宽高,对应hyp中的anchor_t
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
                     # 这里是由于 OpenVINO TensorRT暂时不支持原地修改的操作,只能另赋值然后cat来代替
-                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2)  # wh
+                    xy = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, y[..., 4:]), -1)
                 z.append(y.view(bs, -1, self.no))  # [bs,na,ny,nx,nc] -> [bs,na*ny*nx,no]
 
         return x if self.training else (torch.cat(z, 1), x)
 
-    @staticmethod
-    def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+    def _make_grid(self, nx=20, ny=20, i=0):
+        d = self.anchors[i].device
+        if check_version(torch.__version__, '1.10.0'):  # torch>=1.10.0 meshgrid workaround for torch>=0.7 compatibility
+            yv, xv = torch.meshgrid([torch.arange(ny, device=d), torch.arange(nx, device=d)], indexing='ij')
+        else:
+            yv, xv = torch.meshgrid([torch.arange(ny, device=d), torch.arange(nx, device=d)])
+        grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
+        anchor_grid = (self.anchors[i].clone() * self.stride[i]) \
+            .view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
+        return grid, anchor_grid
 
 
 class Model(nn.Module):
@@ -86,7 +91,7 @@ class Model(nn.Module):
         else:  # is *.yaml
             import yaml
             self.yaml_file = Path(cfg).name  # 这个变量貌似没有用处
-            with open(cfg) as f:
+            with open(cfg, encoding='ascii', errors='ignore') as f:
                 self.yaml = yaml.safe_load(f)  # 从 'model.yaml' 加载的配置
 
         # 定义模型
@@ -112,7 +117,6 @@ class Model(nn.Module):
             check_anchor_order(m)  # 检查strides与anchors的一致性
             self.stride = m.stride
             self._initialize_biases()  # only run once
-            # LOGGER.info('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
         initialize_weights(self)
@@ -121,10 +125,10 @@ class Model(nn.Module):
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
-            return self.forward_augment(x)  # augmented inference, None
-        return self.forward_once(x, profile, visualize)  # single-scale inference, train
+            return self._forward_augment(x)  # augmented inference, None
+        return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
-    def forward_augment(self, x):
+    def _forward_augment(self, x):
         """
         本质就是把一张图片数据增强(放缩与翻转)后变为三张,并同时送入网络然后将这三张图片结果合并cat返回
         """
@@ -134,35 +138,25 @@ class Model(nn.Module):
         y = []  # outputs
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            yi = self.forward_once(xi)[0]  # forward
+            yi = self._forward_once(xi)[0]  # forward
             # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, 1), None  # augmented inference, train
 
-    def forward_once(self, x, profile=False, visualize=False):
+    def _forward_once(self, x, profile=False, visualize=False):
         y, dt = [], []  # 各层的输出,每层的耗时
         for m in self.model:
             if m.f != -1:  # 如果当前层的输入不是来自上一层
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # 要么更早层,要么多层
-
             if profile:  # 统计相关层的耗时
-                o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
-                t = time_sync()
-                for _ in range(10):  # 循环10次,让速度趋于正常
-                    _ = m(x)
-                dt.append((time_sync() - t) * 100)  # ms -> s 这里本应该x1000,但由于循环10次所以再除以10,所以最终x100
-                if m == self.model[0]:
-                    LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
-                LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.n_p:10.0f}  {m.type}')
+                self._profile_one_layer(m, x, dt)
             x = m(x)  # run 真正的forward
             y.append(x if m.i in self.save else None)  # 只将那些来自更早的层(from∈int但!=-1,一般来说没有)或会被cat的层的输出保存起来,其余为None
 
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
-
-        if profile:
-            LOGGER.info('%.1fms total' % sum(dt))  # 总耗时
         return x
 
     def _descale_pred(self, p, flips, scale, img_size):
@@ -182,6 +176,30 @@ class Model(nn.Module):
             p = torch.cat((x, y, wh, p[..., 4:]), -1)
         return p
 
+    def _clip_augmented(self, y):
+        # Clip YOLOv5 augmented inference tails
+        nl = self.model[-1].nl  # number of detection layers (P3-P5)
+        g = sum(4 ** x for x in range(nl))  # grid points
+        e = 1  # exclude layer count
+        i = (y[0].shape[1] // g) * sum(4 ** x for x in range(e))  # indices
+        y[0] = y[0][:, :-i]  # large
+        i = (y[-1].shape[1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
+        y[-1] = y[-1][:, i:]  # small
+        return y
+
+    def _profile_one_layer(self, m, x, dt):
+        c = isinstance(m, Detect)  # is final layer, copy input as inplace fix
+        o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
+        t = time_sync()
+        for _ in range(10):
+            m(x.copy() if c else x)
+        dt.append((time_sync() - t) * 100)
+        if m == self.model[0]:
+            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
+        LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+        if c:
+            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
@@ -191,7 +209,7 @@ class Model(nn.Module):
             # 对不同检测层的降维卷积的bias的obj值加上不同的(负)值 stride[8,16,32] -> [-6.68,-5.29,-3.91]
             # 同时根据每个类出现的频率在bias加上不同的值,频率越高bias值越大.不过默认cf为None
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
@@ -208,7 +226,7 @@ class Model(nn.Module):
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         LOGGER.info('Fusing layers... ')
-        for m in self.model.modules():  # 注:官方提供的s m l x 四个模型中的m只是单纯带权重的模块,比如Detect模块是没有任何属性变量的.但如果你自己训练一个模型是会有这些属性的
+        for m in self.model.modules():  # 注:官方提供的n s m l x 模型中的m只是单纯带权重的模块,比如Detect模块是没有任何属性变量的.但如果你自己训练一个模型是会有这些属性的
             if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
@@ -216,35 +234,27 @@ class Model(nn.Module):
         self.info()
         return self
 
-    def nms(self, mode=True):  # add or remove NMS module
-        present = type(self.model[-1]) is NMS  # last layer is NMS
-        if mode and not present:  # mode=True 以及 model[-1] is not NMS  inference模式?
-            LOGGER.info('Adding NMS... ')
-            m = NMS()  # module
-            m.f = -1  # from
-            m.i = self.model[-1].i + 1  # index
-            self.model.add_module(name='%s' % m.i, module=m)  # add
-            self.eval()
-        elif not mode and present:  # mode=False 以及 model[-1] is NMS  training模式?
-            LOGGER.info('Removing NMS... ')
-            self.model = self.model[:-1]  # remove
-        return self
-
-    def autoshape(self):  # add AutoShape module
-        LOGGER.info('Adding AutoShape... ')
-        m = AutoShape(self)  # wrap model
-        copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
-        return m
-
     def info(self, verbose=False, img_size=640):  # print model information
         model_info(self, verbose, img_size)
 
+    def _apply(self, fn):
+        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
+        self = super()._apply(fn)
+        m = self.model[-1]  # Detect()
+        if isinstance(m, Detect):
+            m.stride = fn(m.stride)
+            m.grid = list(map(fn, m.grid))
+            if isinstance(m.anchor_grid, list):
+                m.anchor_grid = list(map(fn, m.anchor_grid))
+        return self
 
-def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输入维度 默认为[3]
-    LOGGER.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+
+def parse_model(d, ch):  # model_dict, input_channels(3)
+    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # anchor的数量(每个yolo层)
     no = na * (nc + 5)
+
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # 如果是strings则进行转义
@@ -254,7 +264,7 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
             except NameError:
                 pass
 
-        n = n_ =max(round(n * gd), 1) if n > 1 else n  # 模块的实际深度
+        n = n_ = max(round(n * gd), 1) if n > 1 else n  # 模块的实际深度
         if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                  BottleneckCSP, C3, C3TR, C3SPP, C3Ghost]:
             c1, c2 = ch[f], args[0]  # 输入维度 , 输出维度
@@ -268,7 +278,7 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
-            c2 = sum([ch[x] for x in f])
+            c2 = sum(ch[x] for x in f)
         elif m is Detect:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # 如果anchors是int则将[[0,1,2,3,4,5]*3]赋值给args[1],后续有check_anchor进行处理
@@ -280,9 +290,9 @@ def parse_model(d, ch):  # 模型参数(dict), [ch]  ch代指所有模块的输�
         else:  # up_sample
             c2 = ch[f]
 
-        m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace('__main__.', '')  # module type 注! str(m)中貌似没有__main__,目前不知道这行代码的作用
-        n_p = sum([x.numel() for x in m_.parameters()])  # number params 参数量
+        n_p = sum(x.numel() for x in m_.parameters())  # number params 参数量
         m_.i, m_.f, m_.type, m_.n_p = i, f, t, n_p  # 模块索引, 输入索引, 模块类型, 模块参数量
         # 输出模型各个模块的相关信息
         LOGGER.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n_, n_p, t, args))
@@ -300,9 +310,10 @@ if __name__ == '__main__':
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--profile', action='store_true', help='profile model speed')
+    parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
-    opt.cfg = check_file(opt.cfg)  # check file
-    set_logging()
+    opt.cfg = check_yaml(opt.cfg)  # check YAML
+    print_args(FILE.stem, opt)
     device = select_device(opt.device)
 
     # Create model
@@ -313,6 +324,14 @@ if __name__ == '__main__':
     if opt.profile:
         img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
         y = model(img, profile=True)
+
+    # Test all models
+    if opt.test:
+        for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
+            try:
+                _ = Model(cfg)
+            except Exception as e:
+                print(f'Error in {cfg}: {e}')
 
     # Tensorboard (not working https://github.com/ultralytics/yolov5/issues/2898)
     # from torch.utils.tensorboard import SummaryWriter
