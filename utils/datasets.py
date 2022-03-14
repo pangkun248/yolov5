@@ -6,35 +6,36 @@ Dataloaders and dataset utils
 import glob
 import hashlib
 import json
-import logging
+import math
 import os
 import random
 import shutil
 import time
 from itertools import repeat
-from multiprocessing.pool import ThreadPool, Pool
+from multiprocessing.pool import Pool, ThreadPool
 from pathlib import Path
 from threading import Thread
+from zipfile import ZipFile
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from PIL import Image, ExifTags
-from torch.utils.data import Dataset
+from PIL import ExifTags, Image, ImageOps
+from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
 from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
-from utils.general import check_requirements, check_file, check_dataset, xywh2xyxy, xywhn2xyxy, xyxy2xywhn, \
-    xyn2xy, segments2boxes, clean_str
+from utils.general import (LOGGER, NUM_THREADS, check_dataset, check_requirements, check_yaml, clean_str,
+                           segments2boxes, xyn2xy, xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
 HELP_URL = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 IMG_FORMATS = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
 VID_FORMATS = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
-NUM_THREADS = min(8, os.cpu_count())  # number of multiprocessing threads
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))  # DPP
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -68,7 +69,7 @@ def exif_size(img):
 def exif_transpose(image):
     """
     Transpose a PIL image accordingly if it has an EXIF Orientation tag.
-    From https://github.com/python-pillow/Pillow/blob/master/src/PIL/ImageOps.py
+    Inplace version of https://github.com/python-pillow/Pillow/blob/master/src/PIL/ImageOps.py exif_transpose()
 
     :param image: The image to transpose.
     :return: An image.
@@ -92,13 +93,15 @@ def exif_transpose(image):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
-                      rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix=''):
-    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
-    with torch_distributed_zero_first(rank):
+                      rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False):
+    if rect and shuffle:
+        LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
+        shuffle = False
+    with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
-                                      augment=augment,  # augment images
-                                      hyp=hyp,  # augmentation hyperparameters
-                                      rect=rect,  # rectangular training
+                                      augment=augment,  # augmentation
+                                      hyp=hyp,  # hyperparameters
+                                      rect=rect,  # rectangular batches
                                       cache_images=cache,
                                       single_cls=single_cls,
                                       stride=int(stride),
@@ -107,20 +110,19 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
                                       prefix=prefix)
 
     batch_size = min(batch_size, len(dataset))
-    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
-    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
-    dataloader = loader(dataset,
-                        batch_size=batch_size,
-                        num_workers=nw,
-                        sampler=sampler,
-                        pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
-    return dataloader, dataset
+    nw = min([os.cpu_count() // WORLD_SIZE, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
+    loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
+    return loader(dataset,
+                  batch_size=batch_size,
+                  shuffle=shuffle and sampler is None,
+                  num_workers=nw,
+                  sampler=sampler,
+                  pin_memory=True,
+                  collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
 
 
-class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
+class InfiniteDataLoader(dataloader.DataLoader):
     """ Dataloader that reuses workers
 
     Uses same syntax as vanilla DataLoader
@@ -139,7 +141,7 @@ class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
             yield next(self.iterator)
 
 
-class _RepeatSampler(object):
+class _RepeatSampler:
     """ Sampler that repeats forever
 
     Args:
@@ -154,9 +156,10 @@ class _RepeatSampler(object):
             yield from iter(self.sampler)
 
 
-class LoadImages:  # for inference
-    def __init__(self, path, img_size=640, stride=32):
-        p = str(Path(path).absolute())  # 未知路径 -> 绝对路径
+class LoadImages:
+    # YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`
+    def __init__(self, path, img_size=640, stride=32, auto=True):
+        p = str(Path(path).resolve())  # 未知路径 -> 绝对路径
         if '*' in p:
             files = sorted(glob.glob(p, recursive=True))  # glob
         elif os.path.isdir(p):
@@ -176,6 +179,7 @@ class LoadImages:  # for inference
         self.nf = ni + nv  # number of files
         self.video_flag = [False] * ni + [True] * nv
         self.mode = 'image'
+        self.auto = auto
         if any(videos):
             self.new_video(videos[0])  # new video
         else:
@@ -196,7 +200,7 @@ class LoadImages:  # for inference
             # 读取视频
             self.mode = 'video'
             ret_val, img0 = self.cap.read()
-            if not ret_val:  # 视频已经读取完了
+            while not ret_val:  # 视频已经读取完了
                 self.count += 1  # 文件索引+1
                 self.cap.release()
                 if self.count == self.nf:  # 如果文件索引越界则直接退出
@@ -207,23 +211,23 @@ class LoadImages:  # for inference
                     ret_val, img0 = self.cap.read()
 
             self.frame += 1  # 当前视频源的帧数位置+1
-            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: ', end='')
+            s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
 
         else:
             # 读取图片
             self.count += 1  # 文件索引+1
             img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
-            print(f'image {self.count}/{self.nf} {path}: ', end='')
+            assert img0 is not None, f'Image Not Found {path}'
+            s = f'image {self.count}/{self.nf} {path}: '
 
         # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+        img = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)[0]
 
         # Convert
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
-        return path, img, img0, self.cap
+        return path, img, img0, self.cap, s
 
     def new_video(self, path):
         self.frame = 0  # 当前视频源的帧数位置
@@ -235,6 +239,7 @@ class LoadImages:  # for inference
 
 
 class LoadWebcam:  # for inference
+    # YOLOv5 local webcam dataloader, i.e. `python detect.py --source 0`
     def __init__(self, pipe='0', img_size=640, stride=32):
         self.img_size = img_size
         self.stride = stride
@@ -260,7 +265,7 @@ class LoadWebcam:  # for inference
         # Print
         assert ret_val, f'Camera Error {self.pipe}'
         img_path = 'webcam.jpg'
-        print(f'webcam {self.count}: ', end='')
+        s = f'webcam {self.count}: '
 
         # Padded resize
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
@@ -269,20 +274,21 @@ class LoadWebcam:  # for inference
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
-        return img_path, img, img0, None
+        return img_path, img, img0, None, s
 
     def __len__(self):
         return 0
 
 
-class LoadStreams:  # multiple IP or RTSP cameras
-    def __init__(self, sources='streams.txt', img_size=640, stride=32):
+class LoadStreams:
+    # YOLOv5 streamloader, i.e. `python detect.py --source 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP streams`
+    def __init__(self, sources='streams.txt', img_size=640, stride=32, auto=True):
         self.mode = 'stream'
         self.img_size = img_size
         self.stride = stride
 
         if os.path.isfile(sources):
-            with open(sources, 'r') as f:
+            with open(sources) as f:
                 sources = [x.strip() for x in f.read().strip().splitlines() if len(x.strip())]
         else:
             sources = [sources]
@@ -290,34 +296,36 @@ class LoadStreams:  # multiple IP or RTSP cameras
         n = len(sources)
         self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
         self.sources = [clean_str(x) for x in sources]  # clean source names for later
+        self.auto = auto
         for i, s in enumerate(sources):  # index, source
             # Start thread to read frames from video stream
-            print(f'{i + 1}/{n}: {s}... ', end='')
+            st = f'{i + 1}/{n}: {s}... '
             if 'youtube.com/' in s or 'youtu.be/' in s:  # if source is YouTube video
                 check_requirements(('pafy', 'youtube_dl'))
                 import pafy
                 s = pafy.new(s).getbest(preftype="mp4").url  # YouTube URL
             s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
             cap = cv2.VideoCapture(s)
-            assert cap.isOpened(), f'Failed to open {s}'
+            assert cap.isOpened(), f'{st}Failed to open {s}'
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps[i] = max(cap.get(cv2.CAP_PROP_FPS) % 100, 0) or 30.0  # 30 FPS fallback
+            fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
             self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float('inf')  # infinite stream fallback
+            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
 
             _, self.imgs[i] = cap.read()  # guarantee first frame
-            self.threads[i] = Thread(target=self.update, args=([i, cap]), daemon=True)
-            print(f" success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
+            self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
+            LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
             self.threads[i].start()
-        print('')  # newline
+        LOGGER.info('')  # newline
 
         # 检查视频源输出是否长宽固定
-        s = np.stack([letterbox(x, self.img_size, stride=self.stride)[0].shape for x in self.imgs], 0)  # shapes
+        s = np.stack([letterbox(x, self.img_size, stride=self.stride, auto=self.auto)[0].shape for x in self.imgs])
         self.rect = np.unique(s, axis=0).shape[0] == 1  # 如果所有帧数长宽固定,则矩形inference
         if not self.rect:
-            print('WARNING: Different stream shapes detected. For optimal performance supply similarly-shaped streams.')
+            LOGGER.warning('WARNING: Stream shapes differ. For optimal performance supply similarly-shaped streams.')
 
-    def update(self, i, cap):
+    def update(self, i, cap, stream):
         # Read stream `i` frames in daemon thread
         n, f, read = 0, self.frames[i], 1  # frame number, frame array, inference every 'read' frame
         while cap.isOpened() and n < f:
@@ -326,7 +334,12 @@ class LoadStreams:  # multiple IP or RTSP cameras
             cap.grab()
             if n % read == 0:
                 success, im = cap.retrieve()
-                self.imgs[i] = im if success else self.imgs[i] * 0
+                if success:
+                    self.imgs[i] = im
+                else:
+                    LOGGER.warning('WARNING: Video stream unresponsive, please check your IP camera connection.')
+                    self.imgs[i] = np.zeros_like(self.imgs[i])
+                    cap.open(stream)  # re-open stream if signal was lost
             time.sleep(1 / self.fps[i])  # wait time
 
     def __iter__(self):
@@ -341,7 +354,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
         # Letterbox
         img0 = self.imgs.copy()
-        img = [letterbox(x, self.img_size, auto=self.rect, stride=self.stride)[0] for x in img0]
+        img = [letterbox(x, self.img_size, stride=self.stride, auto=self.rect and self.auto)[0] for x in img0]
 
         # Stack
         img = np.stack(img, 0)
@@ -350,19 +363,22 @@ class LoadStreams:  # multiple IP or RTSP cameras
         img = img[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
         img = np.ascontiguousarray(img)
 
-        return self.sources, img, img0, None
+        return self.sources, img, img0, None, ''
 
     def __len__(self):
         return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
 def img2label_paths(img_paths):
-    # Define label paths as a function of image paths
+    # Define label paths as a function of image paths  .../images/xxx.jpg -> .../labels/xxx.txt
     sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
 
 
-class LoadImagesAndLabels(Dataset):  # for training/testing
+class LoadImagesAndLabels(Dataset):
+    # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
+    cache_version = 0.6  # dataset labels *.cache version
+
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
         self.img_size = img_size
@@ -373,7 +389,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path  # train/val_dir or train/val.txt
+        self.path = path
         self.albumentations = Albumentations() if augment else None
 
         try:
@@ -384,15 +400,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     f += glob.glob(str(p / '**' / '*.*'), recursive=True)  # 获取p目录下所有的图片路径
                     # f = list(p.rglob('**/*.*'))  # pathlib
                 elif p.is_file():  # file  train/test/val.txt 内容表现为行1->111.jpg 行2->222.jpg ...
-                    with open(p, 'r') as t:
+                    with open(p) as t:
                         t = t.read().strip().splitlines()
                         parent = str(p.parent) + os.sep
                         f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # 如果相对->绝对路径
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
+            self.img_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
@@ -402,17 +418,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
         try:
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache['version'] == 0.4 and cache['hash'] == get_hash(self.label_files + self.img_files)
+            assert cache['version'] == self.cache_version  # same version
+            assert cache['hash'] == get_hash(self.label_files + self.img_files)  # same hash
         except:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
         # 展示缓存信息
         nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
         if exists:
-            d = f"正在扫描 '{cache_path}'中的图片和标签: 正常 {nf},丢失 {nm},无标签 {ne},异常 {nc}."
+            d = f"正在扫描 '{cache_path}'中的图片和标签: 正常: {nf},丢失: {nm},无标签: {ne},异常: {nc}."
             tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
             if cache['msgs']:
-                logging.info('\n'.join(cache['msgs']))  # display warnings
+                LOGGER.info('\n'.join(cache['msgs']))  # display warnings
         assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {HELP_URL}'
 
         # Read cache 下面移除的这三个值是为了方便zip函数.
@@ -422,10 +439,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # 更新图片路径
         self.label_files = img2label_paths(cache.keys())  # 更新label路径,因为有些可能不满足作为训练样本的条件而被剔除
-        if single_cls:
-            for x in self.labels:
-                x[:, 0] = 0
-
         n = len(shapes)  # 可训练图片的张数
         bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # 每张可训练图片对应的batch索引
         nb = bi[-1] + 1  # number of batches
@@ -433,7 +446,21 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.n = n
         self.indices = range(n)
 
-        # 矩形
+        # Update labels
+        include_class = []  # filter labels to include only these classes (optional)
+        include_class_array = np.array(include_class).reshape(1, -1)
+        for i, (label, segment) in enumerate(zip(self.labels, self.segments)):
+            if include_class:
+                j = (label[:, 0:1] == include_class_array).any(1)
+                self.labels[i] = label[j]
+                if segment:
+                    self.segments[i] = segment[j]
+            if single_cls:  # single-class training, merge all classes into 0
+                self.labels[i][:, 0] = 0
+                if segment:
+                    self.segments[i][:, 0] = 0
+
+        # 矩形训练
         if self.rect:
             # 根据高宽比排序 竖的和竖的在一起,横的和横的排一起.主要是为了多张图片组成一个batch时尽可能的减少填充部分
             s = self.shapes  # wh
@@ -476,7 +503,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     gb += self.img_npy[i].stat().st_size
                 else:
                     self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                gb += self.imgs[i].nbytes
+                    gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
             pbar.close()
 
@@ -486,7 +513,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages  丢失,存在,空,异常,警告
         desc = f"{prefix}正在扫描 '{path.parent / path.stem}' 下的图片和标签..."
         with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap_unordered(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
+            pbar = tqdm(pool.imap(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
                         desc=desc, total=len(self.img_files))
             for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
@@ -497,23 +524,23 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     x[im_file] = [l, shape, segments]
                 if msg:
                     msgs.append(msg)
-                pbar.desc = f"{desc}{nf} 正常, {nm} 丢失, {ne} 无标签, {nc} 异常"
+                pbar.desc = f"{desc} 正常: {nf}, 丢失: {nm}, 无标签: {ne}, 异常: {nc}"
 
         pbar.close()
         if msgs:
-            logging.info('\n'.join(msgs))
+            LOGGER.info('\n'.join(msgs))
         if nf == 0:
-            logging.info(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
+            LOGGER.warning(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, len(self.img_files)
         x['msgs'] = msgs  # warnings
-        x['version'] = 0.4  # cache version
+        x['version'] = self.cache_version  # cache version
         try:
             np.save(path, x)  # save cache for next time
             path.with_suffix('.cache.npy').rename(path)  # remove .npy suffix
-            logging.info(f'{prefix}已创建新缓存文件: {path}')
+            LOGGER.info(f'{prefix}已创建新缓存文件: {path}')
         except Exception as e:
-            logging.info(f'{prefix}警告: 缓存文件 {path.parent} 无法写入: {e}')  # 路径有问题
+            LOGGER.warning(f'{prefix}警告: 缓存文件 {path.parent} 无法写入: {e}')  # 路径有问题
         return x
 
     def __len__(self):
@@ -553,7 +580,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
             if self.augment:
-                    img, labels = random_perspective(img, labels,
+                img, labels = random_perspective(img, labels,
                                                  degrees=hyp['degrees'],
                                                  translate=hyp['translate'],
                                                  scale=hyp['scale'],
@@ -561,12 +588,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                                                  perspective=hyp['perspective'])
 
         nl = len(labels)  # number of labels
-        if nl:
+        if nl:  # x1 y1 x2 y2绝对坐标转换为x y w h相对坐标
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
 
         if self.augment:
             # Albumentations
             img, labels = self.albumentations(img, labels)
+            nl = len(labels)  # update after albumentations
 
             # HSV color-space
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
@@ -585,6 +613,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
 
         labels_out = torch.zeros((nl, 6))
         if nl:
@@ -616,9 +645,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         n = len(shapes) // 4
         img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
-        ho = torch.tensor([[0., 0, 0, 1, 0, 0]])  # 因为最终返回的box是归一化的x y w h 所以这里的值代表了x维度加一个图像的宽度,下同.
-        wo = torch.tensor([[0., 0, 1, 0, 0, 0]])
-        s = torch.tensor([[1, 1, .5, .5, .5, .5]])  # scale 这里乘0.5的原因是因为返回的box都是相对值,
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])  # 因为最终返回的box是归一化的x y w h 所以这里的值代表了x维度加一个图像的宽度,下同.
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale 这里乘0.5的原因是因为返回的box都是相对值,
         # 而进行cat的时候box分别在x y维度加了1,导致中心坐标超过了1.以及由于图像宽高翻倍所以box的w h的相对值应相应的减半
         for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
             i *= 4
@@ -626,7 +655,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2., mode='bilinear', align_corners=False)[
                     0].type(img[i].type())
                 l = label[i]
-            else:  # 这里先进行h维度的cat,所以第二个img的box在h维度+1,后面同理.最后再对w维度cat cat(cat(左上,左下),cat(右上,右下))
+            else:  # 这里先进行两次h维度的cat.再对w维度cat cat(cat(左上,左下),cat(右上,右下)) -> 4张图片拼接成一张(下面label同理)
                 im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
                 l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
             img4.append(im)
@@ -649,24 +678,24 @@ def load_image(self, i):
         else:  # read image
             path = self.img_files[i]
             im = cv2.imread(path)  # BGR
-            assert im is not None, 'Image Not Found ' + path
+            assert im is not None, f'Image Not Found {path}'
         h0, w0 = im.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # ratio
         if r != 1:  # 如果最大边长与当网络输入尺度不相等则按最大边长放缩到标准尺寸的比例缩放整张图片
             im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
-                             interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+                            interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
         return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
     else:
         return self.imgs[i], self.img_hw0[i], self.img_hw[i]  # im, hw_original, hw_resized
 
 
 def load_mosaic(self, index):
-    # loads images in a 4-mosaic
-
+    # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
     labels4, segments4 = [], []
     s = self.img_size
-    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
     indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+    random.shuffle(indices)
     for i, index in enumerate(indices):
         # Load image  这里返回的img是resize后的图片.h,w是满足max(h,w)==self.img_size
         img, _, (h, w) = load_image(self, index)
@@ -706,7 +735,7 @@ def load_mosaic(self, index):
 
     # Augment
     img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp['copy_paste'])
-    # ↓(h,w,3)                         ↓(2*h,2*w,3)
+    # ↓(h,w,3)                         ↓(2*h,2*w,3)     shape
     img4, labels4 = random_perspective(img4, labels4, segments4,
                                        degrees=self.hyp['degrees'],
                                        translate=self.hyp['translate'],
@@ -719,11 +748,11 @@ def load_mosaic(self, index):
 
 
 def load_mosaic9(self, index):
-    # loads images in a 9-mosaic
-
+    # YOLOv5 9-mosaic loader. Loads 1 image + 8 random images into a 9-image mosaic
     labels9, segments9 = [], []
     s = self.img_size
     indices = [index] + random.choices(self.indices, k=8)  # 8 additional image indices
+    random.shuffle(indices)
     for i, index in enumerate(indices):
         # Load image
         img, _, (h, w) = load_image(self, index)
@@ -751,7 +780,7 @@ def load_mosaic9(self, index):
             c = s - w, s + h0 - hp - h, s, s + h0 - hp
 
         padx, pady = c[:2]
-        x1, y1, x2, y2 = [max(x, 0) for x in c]  # allocate coords
+        x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
 
         # Labels
         labels, segments = self.labels[index].copy(), self.segments[index].copy()
@@ -761,13 +790,13 @@ def load_mosaic9(self, index):
         labels9.append(labels)
         segments9.extend(segments)
 
-        # Image
+        # Image 就是把九张图片组合到一起,然后把坐标调整一下
         img9[y1:y2, x1:x2] = img[y1 - pady:, x1 - padx:]  # img9[ymin:ymax, xmin:xmax]
         hp, wp = h, w  # height, width previous
 
     # Offset
-    yc, xc = [int(random.uniform(0, s)) for _ in self.mosaic_border]  # mosaic center x, y
-    img9 = img9[yc:yc + 2 * s, xc:xc + 2 * s]
+    yc, xc = (int(random.uniform(0, s)) for _ in self.mosaic_border)  # mosaic center x, y
+    img9 = img9[yc:yc + 2 * s, xc:xc + 2 * s]  # 在1379号框内选取四个点作为最终的mosaic9的图片 裁剪宽高为2倍img_size
 
     # Concat/clip labels
     labels9 = np.concatenate(labels9, 0)
@@ -822,7 +851,7 @@ def extract_boxes(path='../datasets/coco128'):  # from utils.datasets import *; 
             # labels
             lb_file = Path(img2label_paths([str(im_file)])[0])
             if Path(lb_file).exists():
-                with open(lb_file, 'r') as f:
+                with open(lb_file) as f:
                     lb = np.array([x.split() for x in f.read().strip().splitlines()], dtype=np.float32)  # labels
 
                 for j, x in enumerate(lb):
@@ -850,7 +879,7 @@ def autosplit(path='../datasets/coco128/images', weights=(0.9, 0.1, 0.0), annota
         annotated_only:  Only use images with an annotated txt file
     """
     path = Path(path)  # images dir
-    files = sum([list(path.rglob(f"*.{img_ext}")) for img_ext in IMG_FORMATS], [])  # image files only
+    files = sorted(x for x in path.rglob('*.*') if x.suffix[1:].lower() in IMG_FORMATS)  # image files only
     n = len(files)  # number of files
     random.seed(0)  # for reproducibility
     indices = random.choices([0, 1, 2], weights=weights, k=n)  # assign each image to a split
@@ -868,7 +897,7 @@ def autosplit(path='../datasets/coco128/images', weights=(0.9, 0.1, 0.0), annota
 def verify_image_label(args):
     # Verify one image-label pair
     im_file, lb_file, prefix = args
-    nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, corrupt
+    nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
     try:
         # 检查图片 主要是内容是否损坏 是否翻转 是否过小 格式是否支持
         im = Image.open(im_file)
@@ -879,31 +908,38 @@ def verify_image_label(args):
         if im.format.lower() in ('jpg', 'jpeg'):
             with open(im_file, 'rb') as f:
                 f.seek(-2, 2)
-                assert f.read() == b'\xff\xd9', 'corrupted JPEG'  # 图片以不正常状态结束,通常表现为图片末尾几行为灰色,重新读写可解决
+                if f.read() != b'\xff\xd9':  # corrupt JPEG 图片以不正常状态结束,通常表现为图片末尾几行为灰色,重新读写可解决
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                    msg = f'{prefix}WARNING: {im_file}: corrupt JPEG restored and saved'
 
         # verify labels
-        segments = []  # instance segments
         if os.path.isfile(lb_file):
             nf = 1  # label found
-            with open(lb_file, 'r') as f:
+            with open(lb_file) as f:
                 l = [x.split() for x in f.read().strip().splitlines() if len(x)]
                 if any([len(x) > 8 for x in l]):  # is segment
                     classes = np.array([x[0] for x in l], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
                     l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 l = np.array(l, dtype=np.float32)
-            if len(l):
+            nl = len(l)
+            if nl:
                 assert l.shape[1] == 5, '标签需要五列数据'
                 assert (l >= 0).all(), '标签有负值'
                 assert (l[:, 1:] <= 1).all(), '标签越界'
-                assert np.unique(l, axis=0).shape[0] == l.shape[0], '标签重复'
+                _, i = np.unique(l, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    l = l[i]  # remove duplicates
+                    if segments:
+                        segments = segments[i]
+                    msg = f'{prefix}WARNING: {im_file}: {nl - len(i)} duplicate labels removed'
             else:
                 ne = 1  # 图像内无标注物体
                 l = np.zeros((0, 5), dtype=np.float32)
         else:
             nm = 1  # 标签丢失 意味着图片对应的标签文件不存在.此时默认无标签处理
             l = np.zeros((0, 5), dtype=np.float32)
-        return im_file, l, shape, segments, nm, nf, ne, nc, ''
+        return im_file, l, shape, segments, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1
         msg = f'{prefix}警告: 正在忽略损坏的图像和/或标签  {im_file}: {e}'
@@ -923,28 +959,38 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False, profil
 
     def round_labels(labels):
         # Update labels to integer class and 6 decimal place floats
-        return [[int(c), *[round(x, 4) for x in points]] for c, *points in labels]
+        return [[int(c), *(round(x, 4) for x in points)] for c, *points in labels]
 
     def unzip(path):
         # Unzip data.zip TODO: CONSTRAINT: path/to/abc.zip MUST unzip to 'path/to/abc/'
         if str(path).endswith('.zip'):  # path is data.zip
             assert Path(path).is_file(), f'Error unzipping {path}, file not found'
-            assert os.system(f'unzip -q {path} -d {path.parent}') == 0, f'Error unzipping {path}'
-            dir = path.with_suffix('')  # dataset directory
+            ZipFile(path).extractall(path=path.parent)  # unzip
+            dir = path.with_suffix('')  # dataset directory == zip name
             return True, str(dir), next(dir.rglob('*.yaml'))  # zipped, data_dir, yaml_path
         else:  # path is data.yaml
             return False, None, path
 
     def hub_ops(f, max_dim=1920):
-        # HUB ops for 1 image 'f'
-        im = Image.open(f)
-        r = max_dim / max(im.height, im.width)  # ratio
-        if r < 1.0:  # image too large
-            im = im.resize((int(im.width * r), int(im.height * r)))
-        im.save(im_dir / Path(f).name, quality=75)  # save
+        # HUB ops for 1 image 'f': resize and save at reduced quality in /dataset-hub for web/app viewing
+        f_new = im_dir / Path(f).name  # dataset-hub image filename
+        try:  # use PIL
+            im = Image.open(f)
+            r = max_dim / max(im.height, im.width)  # ratio
+            if r < 1.0:  # image too large
+                im = im.resize((int(im.width * r), int(im.height * r)))
+            im.save(f_new, 'JPEG', quality=75, optimize=True)  # save
+        except Exception as e:  # use OpenCV
+            print(f'WARNING: HUB ops PIL failure {f}: {e}')
+            im = cv2.imread(f)
+            im_height, im_width = im.shape[:2]
+            r = max_dim / max(im_height, im_width)  # ratio
+            if r < 1.0:  # image too large
+                im = cv2.resize(im, (int(im_width * r), int(im_height * r)), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(str(f_new), im)
 
     zipped, data_dir, yaml_path = unzip(Path(path))
-    with open(check_file(yaml_path), errors='ignore') as f:
+    with open(check_yaml(yaml_path), errors='ignore') as f:
         data = yaml.safe_load(f)  # data dict
         if zipped:
             data['path'] = data_dir  # TODO: should this be dir.resolve()?
@@ -988,7 +1034,7 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False, profil
             with open(file, 'w') as f:
                 json.dump(stats, f)  # save stats *.json
             t2 = time.time()
-            with open(file, 'r') as f:
+            with open(file) as f:
                 x = json.load(f)  # load hyps dict
             print(f'stats.json times: {time.time() - t2:.3f}s read, {t2 - t1:.3f}s write')
 

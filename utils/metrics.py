@@ -18,7 +18,7 @@ def fitness(x):
     return (x[:, :4] * w).sum(1)
 
 
-def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=()):
+def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=(), eps=1e-16):
     """ Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
@@ -37,15 +37,15 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]  # tp conf pred_cls 根据conf从大到小进行重排序
 
     # 获取验证集中出现的所有类别
-    unique_classes = np.unique(target_cls)
+    unique_classes, nt = np.unique(target_cls, return_counts=True)
     nc = unique_classes.shape[0]  # 验证集中出现的类别总数
 
     # 创建P-R曲线,并计算每类的AP
     px, py = np.linspace(0, 1, 1000), []  # for plotting
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
-    for ci, c in enumerate(unique_classes):  # 按类计算P R AP等信息
+    for ci, c in enumerate(unique_classes):  # 按类计算P R AP等信息 使用enumerate而多出来的ci原因是索引必须int,而c是float
         i = pred_cls == c
-        n_l = (target_cls == c).sum()  # target_box中 类别c 的个数
+        n_l = nt[ci]  # target_box中 类别c 的个数
         n_p = i.sum()  # pred_box中为 类别c 的个数
 
         if n_p == 0 or n_l == 0:  # 如果没有合格的检测结果或标注物体 则跳过类别c 实际n_l不可能为0
@@ -53,10 +53,10 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
         else:
             # 计算 FPs and TPs
             fpc = (1 - tp[i]).cumsum(0)
-            tpc = tp[i].cumsum(0)
+            tpc = tp[i].cumsum(0)  # 把某类下同一iou的所有tp都累加到一起,但维度并没有坍缩  tp.shape -> [detections.shape[0],10]
 
             # Recall = TP / (TP + FN) = TP / num_target
-            recall = tpc / (n_l + 1e-16)  # 召回曲线 上面的if已经对n_l=0进行处理了,这里还有必要+1e-16?
+            recall = tpc / (n_l + eps)  # 召回曲线 上面的if已经对n_l=0进行处理了,这里还有必要+1e-16?
             # 这里是根据线性插值法获取[0,1]之间的多个conf值对应的recall值,至于为什么加负号,因为x与xp参数要求必须↑,而conf是↓,所以-conf
             r[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)  # negative x, xp because xp decreases  ↓
 
@@ -71,7 +71,9 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5 通过线性差值的方法得到1000个[0,1]之间对应的p
 
     #  F1_score (P、R的调和平均值) P、R曲线是以conf与P、R为基准通过线性插值生成出的1000个点,可以说这1000个点来代表了conf与P、R的关系
-    f1 = 2 * p * r / (p + r + 1e-16)
+    f1 = 2 * p * r / (p + r + eps)
+    names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
+    names = {i: v for i, v in enumerate(names)}  # to dict
     if plot:
         plot_pr_curve(px, py, ap, Path(save_dir) / 'PR_curve.png', names)
         plot_mc_curve(px, f1, Path(save_dir) / 'F1_curve.png', names, ylabel='F1')
@@ -79,7 +81,10 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
         plot_mc_curve(px, r, Path(save_dir) / 'R_curve.png', names, ylabel='Recall')
 
     i = f1.mean(0).argmax()  # max F1 index 相对于[0,999]  最后返回F1_score最大处的点对应的 P、R、F1等值 AP除外
-    return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32')
+    p, r, f1 = p[:, i], r[:, i], f1[:, i]
+    tp = (r * nt).round()  # true positives
+    fp = (tp / (p + eps) - tp).round()  # false positives
+    return tp, fp, p, r, f1, ap, unique_classes.astype('int32')
 
 
 def compute_ap(recall, precision):
@@ -92,10 +97,10 @@ def compute_ap(recall, precision):
     """
 
     # Append sentinel values to beginning and end
-    mrec = np.concatenate(([0.], recall, [recall[-1] + 0.01]))
-    mpre = np.concatenate(([1.], precision, [0.]))
+    mrec = np.concatenate(([0.], recall, [1.0]))
+    mpre = np.concatenate(([1.], precision, [0.0]))
 
-    # Compute the precision envelope 参考 https://www.it1352.com/240349.html
+    # Compute the precision envelope np.maximum.accumulate:[2, 0, 3, -4, -2, 7, 9] -> [2, 2, 3, 3, 3, 7, 9]
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
 
     # 计算曲线下的面积
@@ -105,7 +110,7 @@ def compute_ap(recall, precision):
         ap = np.trapz(np.interp(x, mrec, mpre), x)  # 积分 https://www.osgeo.cn/numpy/reference/generated/numpy.trapz.html
     else:  # 'continuous'
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes 因为改变是相对值,排除第一个值,所以[1:]
-        ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve  因为i是基于[:1],所以要+1
+        ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve  因为i是基于[1:],所以要+1
 
     return ap, mpre, mrec
 
@@ -134,15 +139,15 @@ class ConfusionMatrix:
         iou = box_iou(labels[:, 1:], detections[:, :4])  # 注! 这里没有在统一class下计算IoU,表现为在混淆矩阵上非对角线位置会有值
 
         x = torch.where(iou > self.iou_thres)  # 与 torch.nonzero(condition, as_tuple=True) 结果相同
-        if x[0].shape[0]:  # 对matches重新整理 -> [c,3] iou_index(2) iou_value(1) c为满足iou_thresh值的c个iou
+        if x[0].shape[0]:  # 对matches -> [c,3] 其中iou_index(2)、iou_value(1) c为满足iou_thresh值的c个iou
             matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
             if x[0].shape[0] > 1:
                 """
                 1.根据IoU值对matches排序(从大到小)
-                2.获取每个pred_box中最大IoU的matches
+                2.获取所有detections(排序后)中最大IoU的matches
                 3.根据IoU值matches重新排序(从大到小)
-                4.获取每个gt_box中最大的IoU,这样得到的IoU就是gt_box与pred_box一对一且是最大IoU(对双方来说)
-                这样做的目的是为了获取多个pred_box与多个gt_box中最大IoU的那些matches 此时matches -> [v,3] v<=c(大概率v<<c)
+                4.获取所有labels中最大的IoU,这样得到的IoU就是gt_box与pred_box一对一且是最大IoU(对双方来说)
+                这样做的目的是为了获取多个detections与多个labels中最大IoU的那些matches 此时matches -> [v,3] v<=c(大概率v<<c)
                 """
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
@@ -152,9 +157,9 @@ class ConfusionMatrix:
             matches = np.zeros((0, 3))
 
         n = matches.shape[0] > 0
-        m0, m1, _ = matches.transpose().astype(np.int16)  # 此处m0,m1分别指matches在gt_boxes、pre_boxes中的索引
+        m0, m1, _ = matches.transpose().astype(np.int16)  # 此处m0,m1分别为labels、detections中的索引
         for i, gc in enumerate(gt_classes):  # 针对所有的标记结果,只有TP与FP 总感觉应该和下面的倒过来(-> TP+FN)
-            j = m0 == i  # 该gt_box是否在matches(TP)中
+            j = m0 == i  # 该detection是否在matches(TP)中
             if n and sum(j) == 1:  # 改成j.any() 是否会更合适?
                 self.matrix[detection_classes[m1[j]], gc] += 1  # 注这里并非是TP,只是经过nms的与target有最佳匹配IoU的box(忽略了类一致性)
             else:
@@ -167,6 +172,12 @@ class ConfusionMatrix:
 
     def matrix(self):
         return self.matrix
+
+    def tp_fp(self):
+        tp = self.matrix.diagonal()  # true positives
+        fp = self.matrix.sum(1) - tp  # false positives
+        # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
+        return tp[:-1], fp[:-1]  # remove background class
 
     def plot(self, normalize=True, save_dir='', names=()):
         try:
@@ -186,6 +197,7 @@ class ConfusionMatrix:
             fig.axes[0].set_xlabel('True')
             fig.axes[0].set_ylabel('Predicted')
             fig.savefig(Path(save_dir) / 'confusion_matrix.png', dpi=250)
+            plt.close()
         except Exception as e:
             print(f'WARNING: ConfusionMatrix plot failure: {e}')
 
@@ -218,25 +230,22 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
     union = w1 * h1 + w2 * h2 - inter + eps
 
     iou = inter / union
-    if GIoU or DIoU or CIoU:
+    if CIoU or DIoU or GIoU:
         cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
         ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
         if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
             c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
             rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
                     (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared
-            if DIoU:
-                return iou - rho2 / c2  # DIoU
-            elif CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
+            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
                 v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
                 with torch.no_grad():
                     alpha = v / (v - iou + (1 + eps))
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
-        else:  # GIoU https://arxiv.org/pdf/1902.09630.pdf
-            c_area = cw * ch + eps  # convex area
-            return iou - (c_area - union) / c_area  # GIoU
-    else:
-        return iou  # IoU
+            return iou - rho2 / c2  # DIoU
+        c_area = cw * ch + eps  # convex area
+        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
+    return iou  # IoU
 
 
 def box_iou(box1, box2):
@@ -317,6 +326,7 @@ def plot_pr_curve(px, py, ap, save_dir='pr_curve.png', names=()):
     ax.set_ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")  # 参考 http://www.deiniu.com/article/186659.htm
     fig.savefig(Path(save_dir), dpi=250)
+    plt.close()
 
 
 def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence', ylabel='Metric'):
@@ -337,3 +347,4 @@ def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence'
     ax.set_ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
     fig.savefig(Path(save_dir), dpi=250)
+    plt.close()

@@ -3,14 +3,13 @@
 Image augmentation functions
 """
 
-import logging
 import math
 import random
 
 import cv2
 import numpy as np
 
-from utils.general import colorstr, segment2box, resample_segments, check_version
+from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box
 from utils.metrics import bbox_ioa
 
 
@@ -20,19 +19,23 @@ class Albumentations:
         self.transform = None
         try:
             import albumentations as A
-            check_version(A.__version__, '1.0.3')  # version requirement
+            check_version(A.__version__, '1.0.3', hard=True)  # version requirement
 
             self.transform = A.Compose([
-                A.Blur(p=0.1),
-                A.MedianBlur(p=0.1),
-                A.ToGray(p=0.01)],
+                A.Blur(p=0.01),
+                A.MedianBlur(p=0.01),
+                A.ToGray(p=0.01),
+                A.CLAHE(p=0.01),
+                A.RandomBrightnessContrast(p=0.0),
+                A.RandomGamma(p=0.0),
+                A.ImageCompression(quality_lower=75, p=0.0)],
                 bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-            logging.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
+            LOGGER.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
         except ImportError:  # package not installed, skip
             pass
         except Exception as e:
-            logging.info(colorstr('albumentations: ') + f'{e}')
+            LOGGER.info(colorstr('albumentations: ') + f'{e}')
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
@@ -70,7 +73,7 @@ def hist_equalize(im, clahe=True, bgr=False):
 
 
 def replicate(im, labels):
-    # Replicate labels
+    # Replicate labels 数据增强的一种方式.将已有的较小物体(仅box)水平垂直翻转后覆盖到原始图像上,label也是  注意是box而非像素点翻转！！！
     h, w = im.shape[:2]
     boxes = labels[:, 1:].astype(int)
     x1, y1, x2, y2 = boxes.T
@@ -224,6 +227,7 @@ def random_perspective(im, targets=(), segments=(), degrees=10, translate=.1, sc
 
 
 def copy_paste(im, labels, segments, p=0.5):
+    # 该方法其实就是将目标(分割)区域 水平翻转一下然后覆盖到原始图像上,只不过原始分割区域不能超过图像中间太多(超出自身0.3倍区域面积)
     # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
     n = len(segments)
     if p and n:
@@ -231,18 +235,18 @@ def copy_paste(im, labels, segments, p=0.5):
         im_new = np.zeros(im.shape, np.uint8)
         for j in random.sample(range(n), k=round(p * n)):
             l, s = labels[j], segments[j]
-            box = w - l[3], l[2], w - l[1], l[4]
-            ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
-            if (ioa < 0.30).all():  # allow 30% obscuration of existing labels
+            box = w - l[3], l[2], w - l[1], l[4]  # 水平方向翻转后的l
+            ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area 计算水平翻转后的box与原始box的IOA
+            if (ioa < 0.30).all():  # allow 30% obscuration of existing labels 如果ioa小于0.3,则复制其分割区域到水平另一侧
                 labels = np.concatenate((labels, [[l[0], *box]]), 0)
-                segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))
-                cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (255, 255, 255), cv2.FILLED)
+                segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))  # 将翻转后的seg坐标添加进来
+                cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (255, 255, 255), cv2.FILLED)  # 原始分割区域赋值
 
-        result = cv2.bitwise_and(src1=im, src2=im_new)
-        result = cv2.flip(result, 1)  # augment segments (flip left-right)
-        i = result > 0  # pixels to replace
+        result = cv2.bitwise_and(src1=im, src2=im_new)  # 获取分割区域像素
+        result = cv2.flip(result, 1)  # augment segments (flip left-right) 将原始分割区域水平翻转
+        i = result > 0  # pixels to replace  获取翻转后的分割区域像素索引
         # i[:, :] = result.max(2).reshape(h, w, 1)  # act over ch
-        im[i] = result[i]  # cv2.imwrite('debug.jpg', im)  # debug
+        im[i] = result[i]  # cv2.imwrite('debug.jpg', im)  # debug  将翻转后的区域覆盖到原始图像上  注意是像素点翻转！！！
 
     return im, labels, segments
 
@@ -283,7 +287,7 @@ def mixup(im, labels, im2, labels2):
     return im, labels
 
 
-def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
+def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]  # 变换后的box的宽高、面积必须分别大于wh_thr、area_thr阈值
