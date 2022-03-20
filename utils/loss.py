@@ -140,7 +140,8 @@ class ComputeLoss:
                 if self.sort_obj_iou:
                     sort_id = torch.argsort(score_iou)
                     b, a, gj, gi, score_iou = b[sort_id], a[sort_id], gj[sort_id], gi[sort_id], score_iou[sort_id]
-                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio 融合了gt与anchor的iou why?
+                # https://github.com/ultralytics/yolov5/issues/471#issuecomment-742524530 如果直接置为1,mAP会降
+                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * score_iou  # iou ratio 为了帮助nms减少低质量的box
 
                 # Classification 类别置信度
                 if self.nc > 1:  # cls loss (only if multiple classes)
