@@ -190,7 +190,7 @@ class ComputeLoss:
 
         g = 0.5  # bias
         off = torch.tensor([[0, 0],
-                            [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m 左上右下 因为下面off是要被减的,所以"左正右负,上正下负"
+                            [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m 左上右下 因为下面offset是要被减的,所以"左正右负,上正下负"
                             # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                             ], device=targets.device).float() * g  # offsets  乘以偏移值  [5, 2]
         for i in range(self.nl):
@@ -233,7 +233,7 @@ class ComputeLoss:
             # Append
             a = t[:, 6].long()  # anchor indices 每个target对应某一尺度下的第几个anchor ([3,3,2]中的第二维度的索引)
             indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
-            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box  这里的gxy - gij实际上是target的偏移值[0,1) (包括其领域的target)
+            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box  这里的gxy - gij实际上是target的偏移值[0,1) (包括其邻域的target)
             anch.append(anchors[a])  # anchors (index ie 0,1,2)
             tcls.append(c)  # class
 
